@@ -1,0 +1,88 @@
+name: Windows EXE — Build and Release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Publish or update v0.3.0 in Releases with Windows EXE"
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Test and build Windows EXE
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Run automated tests
+        run: python -m pytest -q
+
+      - name: Build standalone EXE
+        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name SeismicTravelTimePicker main.py
+
+      - name: Verify EXE exists
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist/SeismicTravelTimePicker.exe")) {
+            throw "Build did not produce SeismicTravelTimePicker.exe"
+          }
+
+      - name: Attach Windows artifact to workflow run
+        uses: actions/upload-artifact@v4
+        with:
+          name: SeismicTravelTimePicker-Windows
+          path: dist/SeismicTravelTimePicker.exe
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish Windows release
+    needs: build-windows
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release notes
+        uses: actions/checkout@v4
+
+      - name: Download built Windows EXE
+        uses: actions/download-artifact@v4
+        with:
+          name: SeismicTravelTimePicker-Windows
+          path: release
+
+      - name: Publish or update v0.3.0 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v0.3.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="release/SeismicTravelTimePicker.exe"
+          test -s "$asset"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$asset" --clobber
+          else
+            gh release create "$TAG" "$asset" \
+              --target "$GITHUB_SHA" \
+              --title "Seismic TravelTime Picker v0.3.0" \
+              --notes-file RELEASE_NOTES.md
+          fi
