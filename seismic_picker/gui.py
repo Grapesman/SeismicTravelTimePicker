@@ -12,6 +12,8 @@ matplotlib.use('TkAgg')
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.ticker import MultipleLocator
+from matplotlib.patches import Rectangle
+from .workspace import SessionLibrary
 
 from . import __version__
 from .segy import read_segy, SeismicRecord, SegyError
@@ -22,10 +24,24 @@ from .qc import audit_picks, check_phase_continuity
 class PickerApp(tk.Tk):
     def __init__(self, initial_file: str | None = None):
         super().__init__()
-        self.title(f'Seismic TravelTime Picker  •  {__version__}')
+        self.title(f'SeisPeak  •  Seismic TravelTime Picker  •  {__version__}')
         self.geometry('1550x930')
         self.minsize(1100, 680)
         self.configure(bg='#f3f6fb')
+        # Branding icon: usable when running from sources and inside PyInstaller EXE.
+        self._app_icon = None
+        try:
+            base_path = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent.parent))
+            icon_file = base_path / 'assets' / 'seispeak_icon.png'
+            if icon_file.is_file():
+                self._app_icon = tk.PhotoImage(file=str(icon_file))
+                self.iconphoto(True, self._app_icon)
+        except (tk.TclError, OSError):
+            pass
+        self.sessions = SessionLibrary()
+        self.current_path: Path | None = None
+        self.workspace_path: Path | None = None
+        self._switching = False
         self.record: SeismicRecord | None = None
         self.state_model: PickerState | None = None
         self.display_signals: np.ndarray | None = None
@@ -33,6 +49,9 @@ class PickerApp(tk.Tk):
         self._signals_cache_key = None
         self._signals_cache = None
         self.gain_var = tk.DoubleVar(value=1.1)
+        self.gain_label_var=tk.StringVar(value='1.10×')
+        self.gain_var.trace_add('write',lambda *_:self.gain_label_var.set(f'{self.gain_var.get():.2f}×'))
+        self.unit_var = tk.StringVar(value='мс')
         self.agc_var = tk.BooleanVar(value=True)
         self.color_var = tk.BooleanVar(value=True)
         self.pol_var = tk.StringVar(value='positive')
@@ -57,7 +76,14 @@ class PickerApp(tk.Tk):
         self.selected_trace: int | None = None
         self.history: list[dict[int,int]] = []
         self._draw_pending = False
+        self._region_start = None
+        self._region_patch = None
+        self._region_origin = None
+        self.full_xlim = None
+        self.full_ylim = None
         self._make_ui()
+        self.bind('<Control-Next>',lambda e:self.shift_file(1))
+        self.bind('<Control-Prior>',lambda e:self.shift_file(-1))
         self.bind('<Control-o>', lambda e: self.open_file())
         self.bind('<Control-p>', lambda e: self.propose_phase())
         self.bind('<Control-s>', lambda e: self.save_project())
@@ -92,10 +118,13 @@ class PickerApp(tk.Tk):
         menu = tk.Menu(self)
         fm = tk.Menu(menu, tearoff=0)
         fm.add_command(label='Открыть SEG-Y...  Ctrl+O', command=self.open_file)
-        fm.add_command(label='Открыть проект...', command=self.open_project)
+        fm.add_command(label='Добавить папку с SGY...',command=self.open_folder)
+        fm.add_command(label='Открыть проект / сеанс...', command=self.open_project)
+        fm.add_command(label='Сохранить все сейсмограммы...', command=self.save_workspace)
         fm.add_command(label='Сохранить проект...  Ctrl+S', command=self.save_project)
         fm.add_separator()
         fm.add_command(label='Экспорт TXT...', command=lambda: self.export('txt'))
+        fm.add_command(label='Экспорт TXT всех открытых SGY...', command=self.export_all)
         fm.add_command(label='Экспорт CSV...', command=lambda: self.export('csv'))
         fm.add_command(label='Сохранить изображение...', command=self.export_image)
         fm.add_separator(); fm.add_command(label='Выход', command=self.on_close)
@@ -111,7 +140,7 @@ class PickerApp(tk.Tk):
         info = tk.Menu(menu, tearoff=0)
         info.add_command(label='Инструкция', command=self.help_dialog)
         info.add_command(label='О программе', command=lambda: messagebox.showinfo('О программе',
-            'Seismic TravelTime Picker v'+__version__+'\nТочное ручное пикирование по отсчётам SEG-Y.\nПрототип; необходима дополнительная проверка перед промышленным применением.'))
+            'SeisPeak · Seismic TravelTime Picker v'+__version__+'\nТочное ручное пикирование по отсчётам SEG-Y.\nПрототип; необходима дополнительная проверка перед промышленным применением.'))
         menu.add_cascade(label='Помощь', menu=info)
         self.config(menu=menu)
 
@@ -132,12 +161,30 @@ class PickerApp(tk.Tk):
         ttk.Button(bar, text='Удалить точку', command=self.delete_selected).pack(side='left', padx=3)
         ttk.Button(bar, text='▶ Проследить фазу', style='Primary.TButton', command=self.propose_phase).pack(side='left', padx=6)
         ttk.Label(bar, text='  Усиление', foreground='#334155').pack(side='left', padx=(14,3))
-        ttk.Scale(bar, from_=0.2, to=3, variable=self.gain_var, orient='horizontal', length=125,
-                  command=lambda _v: self.request_redraw()).pack(side='left')
+        ttk.Button(bar, text='−', width=2, command=lambda: self.change_gain(-0.1)).pack(side='left',padx=(2,0))
+        self.gain_slider = ttk.Scale(bar, from_=0.2, to=3, variable=self.gain_var,
+                  orient='horizontal', length=95, command=lambda _v: self.request_redraw())
+        self.gain_slider.pack(side='left')
+        ttk.Button(bar, text='+', width=2, command=lambda: self.change_gain(0.1)).pack(side='left',padx=(0,2))
+        ttk.Label(bar,textvariable=self.gain_label_var,foreground='#475569').pack(side='left',padx=(1,2))
         ttk.Checkbutton(bar, text='AGC', variable=self.agc_var, command=self.request_redraw).pack(side='left', padx=8)
         ttk.Checkbutton(bar, text='Цвет', variable=self.color_var, command=self.request_redraw).pack(side='left')
         ttk.Checkbutton(bar, text='Проекции', variable=self.show_guides_var, command=self.request_redraw).pack(side='left',padx=8)
         ttk.Button(bar, text='Сброс масштаба', command=self.reset_view).pack(side='right')
+
+        # A separate thin navigation row remains usable on 1100-pixel displays.
+        files_bar=ttk.Frame(self, padding=(13,0,13,7));files_bar.pack(fill='x')
+        ttk.Label(files_bar,text='СЕЙСМОГРАММА',foreground='#164a73').pack(side='left',padx=(0,8))
+        ttk.Button(files_bar,text='◀',width=3,command=lambda:self.shift_file(-1)).pack(side='left',padx=2)
+        self.file_select_var=tk.StringVar()
+        self.file_select=ttk.Combobox(files_bar,textvariable=self.file_select_var,state='readonly',width=55)
+        self.file_select.pack(side='left',padx=4,fill='x',expand=True)
+        self.file_select.bind('<<ComboboxSelected>>',self._selector_changed)
+        ttk.Button(files_bar,text='▶',width=3,command=lambda:self.shift_file(1)).pack(side='left',padx=2)
+        self.file_counter=ttk.Label(files_bar,text='0 / 0',foreground='#475569')
+        self.file_counter.pack(side='left',padx=(8,0))
+        ttk.Label(files_bar,text='Колесо: зум · Shift + протянуть: выделить область',
+                  foreground='#64748b').pack(side='right',padx=(14,0))
 
         body = ttk.Panedwindow(self, orient='horizontal'); body.pack(fill='both',expand=True, padx=10,pady=(0,4))
         plot_frame = ttk.Frame(body)
@@ -154,6 +201,7 @@ class PickerApp(tk.Tk):
         self.canvas.mpl_connect('button_press_event', self.on_click)
         self.canvas.mpl_connect('motion_notify_event', self.on_motion)
         self.canvas.mpl_connect('button_release_event', self.on_release)
+        self.canvas.mpl_connect('scroll_event', self.on_scroll)
         self.ax.text(.5,.5,'Откройте .SGY / .SEGY файл\nдля отображения сейсмограммы',
                      transform=self.ax.transAxes, ha='center',va='center',fontsize=15,color='#64748b')
         self.ax.set_xticks([]); self.ax.set_yticks([])
@@ -215,7 +263,14 @@ class PickerApp(tk.Tk):
         self.count_label=ttk.Label(block,text='Подтверждено: 0  •  Предложено: 0',foreground='#475569')
         self.count_label.pack(anchor='w',pady=(6,0))
 
-        ttk.Label(tools,text='РЕЗУЛЬТАТЫ · ДВОЙНОЙ КЛИК ДЛЯ ПРАВКИ',font=('Segoe UI',9,'bold'),foreground='#174569').pack(anchor='w',pady=(2,5))
+        results_head=ttk.Frame(tools);results_head.pack(fill='x',pady=(2,5))
+        ttk.Label(results_head,text='РЕЗУЛЬТАТЫ · ДВОЙНОЙ КЛИК ДЛЯ ПРАВКИ',
+                  font=('Segoe UI',9,'bold'),foreground='#174569').pack(side='left')
+        ttk.Label(results_head,text='  Время:').pack(side='left',padx=(6,2))
+        self.units_picker=ttk.Combobox(results_head,textvariable=self.unit_var,
+                                       values=('мс','мкс'),state='readonly',width=4)
+        self.units_picker.pack(side='left')
+        self.units_picker.bind('<<ComboboxSelected>>',lambda _e:self._refresh_time_units())
         tree_frame = ttk.Frame(tools); tree_frame.pack(fill='both',expand=True)
         columns=('id','x','time','kind','quality')
         self.table=ttk.Treeview(tree_frame,columns=columns,show='headings',selectmode='browse',height=12)
@@ -235,31 +290,200 @@ class PickerApp(tk.Tk):
         ttk.Label(status,textvariable=self.info_var,foreground='#153c5a').pack(side='left')
         ttk.Label(status,textvariable=self.stats_var,foreground='#64748b').pack(side='right')
 
-    def open_file(self) -> None:
-        path=filedialog.askopenfilename(title='Открыть SEG-Y',filetypes=[('SEG-Y','*.sgy *.segy *.SGY *.SEGY'),('Все файлы','*.*')])
-        if path:
-            if not self.confirm_discard():return
-            self.load_file(path)
+    def change_gain(self, delta: float):
+        """Nudge the same Tk variable that drives the slider (no alternative gain path)."""
+        value=round(float(self.gain_var.get())+delta,2)
+        self.gain_var.set(max(0.2,min(3.0,value)))
+        self.request_redraw()
 
-    def load_file(self, path: str) -> bool:
+    def _refresh_selector(self):
+        entries=list(self.sessions.entries)
+        options=[f'{i+1:03d}  |  {path.name}' for i,path in enumerate(entries)]
+        self.file_select['values']=options
+        if self.current_path in self.sessions.entries:
+            pos=entries.index(self.current_path)
+            self.file_select.current(pos)
+            self.file_counter.configure(text=f'{pos+1} / {len(entries)}')
+        else:
+            self.file_select_var.set('')
+            self.file_counter.configure(text=f'0 / {len(entries)}')
+
+    def _selector_changed(self, _event=None):
+        i=self.file_select.current()
+        names=list(self.sessions.entries)
+        if 0<=i<len(names):self.activate_file(names[i])
+
+    def shift_file(self, delta: int):
+        names=list(self.sessions.entries)
+        if not names:return
+        index=names.index(self.current_path) if self.current_path in names else 0
+        target=names[(index+delta)%len(names)]
+        self.activate_file(target)
+
+    def open_file(self) -> None:
+        paths=filedialog.askopenfilenames(title='Открыть одну или несколько сейсмограмм SEG-Y',
+            filetypes=[('SEG-Y','*.sgy *.segy *.SGY *.SEGY'),('Все файлы','*.*')])
+        if not paths:return
+        added=self.sessions.add(paths)
+        self._refresh_selector()
+        target=added[0] if added else Path(paths[0]).resolve()
+        if self.activate_file(target):
+            self.info_var.set(f'Загружено {len(added)} новых файлов, всего {len(self.sessions.entries)}. '
+                              'Переключайтесь стрелками или списком вверху.')
+
+    def open_folder(self):
+        folder=filedialog.askdirectory(title='Папка с сейсмограммами SGY/SEG-Y')
+        if not folder:return
+        candidates=sorted(p for p in Path(folder).iterdir()
+                          if p.is_file() and p.suffix.lower() in ('.sgy','.segy'))
+        if not candidates:
+            messagebox.showinfo('Нет SGY','В выбранной папке не найдены файлы SGY/SEG-Y.');return
+        added=self.sessions.add(candidates)
+        if not self.record:self.activate_file(candidates[0])
+        self._refresh_selector()
+        self.info_var.set(f'Добавлено {len(added)} файлов из папки; всего: {len(self.sessions.entries)}.')
+
+    def export_all(self):
+        """Separate TXT files for touched records only, without writing unverified proposals."""
+        self._store_session()
+        ready=[entry for entry in self.sessions.entries.values() if entry.picks]
+        if not ready:
+            messagebox.showinfo('Пакетный экспорт','Нет ни одного SGY с подтверждёнными пиками.');return
+        folder=filedialog.askdirectory(title='Папка для результатов всех SGY')
+        if not folder:return
+        output=Path(folder)
+        exported=[];failures=[]
+        for session in ready:
+            try:
+                rec=read_segy(session.path)
+                session.validate_record(rec)
+                name=session.path.stem+'_traveltime.txt'
+                dest=output/name
+                suffix=2
+                while dest.exists():
+                    dest=output/(session.path.stem+f'_traveltime_{suffix}.txt')
+                    suffix+=1
+                picker=PickerState(rec,picks=session.picks.copy())
+                picker.export_txt(dest)
+                exported.append(dest.name)
+            except (OSError,ValueError,SegyError) as exc:
+                failures.append(f'{session.path.name}: {exc}')
+        msg=f'Сохранено {len(exported)} текстовых файлов в {output}.'
+        if failures:
+            msg+=f'\nОшибок: {len(failures)}\n'+'\n'.join(failures[:5])
+            messagebox.showwarning('Пакетный экспорт',msg)
+        else:messagebox.showinfo('Пакетный экспорт',msg)
+        self.info_var.set(msg.split('\n')[0])
+
+    def _store_session(self):
+        """Store every editable UI field without holding extra SEG-Y arrays in RAM."""
+        if self.current_path not in self.sessions.entries or not self.state_model:return
+        session=self.sessions.entries[self.current_path]
+        state=self.state_model
+        session.picks=state.picks.copy()
+        session.proposals=state.proposals.copy()
+        session.proposal_info=state.proposal_info.copy()
+        session.failed_intervals=state.failed_intervals
+        session.history=[h.copy() for h in self.history]
+        session.selected_trace=self.selected_trace
+        session.dirty=self.unsaved_changes
+        session.gain=self.gain_var.get()
+        session.agc=self.agc_var.get()
+        session.color=self.color_var.get()
+        session.n_traces=self.record.n_traces
+        session.n_samples=self.record.n_samples
+        session.dt_us=self.record.dt_us
+        try: session.file_size=self.record.path.stat().st_size
+        except OSError: session.file_size=None
+        if self.ax.get_xlim()[1]>self.ax.get_xlim()[0] and self.ax.get_ylim()[0]>self.ax.get_ylim()[1]:
+            session.view=(tuple(self.ax.get_xlim()), tuple(self.ax.get_ylim()))
+
+    def activate_file(self, path: str | Path) -> bool:
+        """Activate on demand. Failure leaves current file and its picks untouched."""
+        dest=Path(path).resolve()
+        if dest not in self.sessions.entries:self.sessions.add([dest])
+        if self.current_path==dest and self.record is not None:
+            self._refresh_selector();return True
         try:
-            record=read_segy(path)
+            rec=read_segy(dest)
+            session=self.sessions.entries[dest]
+            session.validate_record(rec)
         except (OSError,SegyError,ValueError) as exc:
-            messagebox.showerror('Ошибка чтения SEG-Y',str(exc));return False
-        self.record=record
-        self.state_model=PickerState(record)
-        self.history.clear()
-        self.unsaved_changes=False
-        self.selected_trace=None
+            messagebox.showerror('Ошибка чтения SEG-Y',f'{dest.name}\n\n{exc}')
+            self._refresh_selector()
+            return False
+        self._store_session()
+        if self.result_window is not None and self.result_window.winfo_exists():
+            self.result_window.destroy()
+        self.result_window=None
+        self.current_path=dest
+        self.record=rec
+        state=PickerState(rec)
+        state.picks=session.picks.copy()
+        state.proposals=session.proposals.copy()
+        state.proposal_info=session.proposal_info.copy()
+        state.failed_intervals=session.failed_intervals
+        self.state_model=state
+        self.history=[h.copy() for h in session.history]
+        self.unsaved_changes=session.dirty
+        self.selected_trace=session.selected_trace
+        self.gain_var.set(session.gain)
+        self.agc_var.set(session.agc)
+        self.color_var.set(session.color)
         self._signals_cache_key = None
         self._signals_cache = None
-        self.title(f'Seismic TravelTime Picker  •  {record.path.name}')
-        coord=record.receiver_x
-        self.stats_var.set(f'{record.n_traces} трасс  •  {record.n_samples} отсчётов  •  {record.dt_us/1000:g} мс  •  X: {coord.min():g}–{coord.max():g} м')
-        self.info_var.set('Файл открыт. Выбирайте вершины пиков мышью. Линия строится по проекциям на оси трасс.')
+        self.display_signals = None
+        self.display_x = None
+        self.title(f'SeisPeak  •  {dest.name}  •  {len(self.sessions.entries)} файлов')
+        coord=rec.receiver_x
+        self.stats_var.set(f'{rec.n_traces} трасс  •  {rec.n_samples} отсчётов  •  '
+                           f'{rec.dt_us/1000:g} мс  •  X: {coord.min():g}–{coord.max():g} м')
         self.draw_plot(keep_view=False)
-        self.update_table()
+        if session.view is not None:
+            self.ax.set_xlim(*session.view[0]);self.ax.set_ylim(*session.view[1]);self.canvas.draw_idle()
+        self.update_table();self._refresh_selector()
+        self.info_var.set(f'Открыта {dest.name}; подтверждено пиков: {len(state.picks)}.')
         return True
+
+    def load_file(self, path: str) -> bool:
+        """Backward-compatible API used by existing single-project loader/tests."""
+        return self.activate_file(path)
+
+    def on_scroll(self,event):
+        """Mouse-centered zoom with wheel/trackpad; axes are in meters and milliseconds."""
+        if not self.record or event.inaxes is not self.ax or self.toolbar.mode:return
+        if event.xdata is None or event.ydata is None:return
+        direction=1 if event.button=='up' else -1 if event.button=='down' else 0
+        if not direction:return
+        scale=1/1.22 if direction>0 else 1.22
+        old_x=self.ax.get_xlim();old_y=self.ax.get_ylim()
+        def zoom(limits, center, minimum):
+            left,right=limits
+            a=center+(left-center)*scale
+            b=center+(right-center)*scale
+            if abs(b-a)<minimum:return limits
+            return a,b
+        coords=self.record.receiver_x
+        dx=float(np.median(np.diff(np.unique(coords)))) if len(np.unique(coords))>1 else 2.
+        new_x=zoom(old_x,event.xdata,max(.1,abs(dx)*.5))
+        new_y=zoom(old_y,event.ydata,self.record.dt_us/1000*5)
+        if scale>1 and self.full_xlim is not None and abs(new_x[1]-new_x[0])>=abs(self.full_xlim[1]-self.full_xlim[0]):
+            new_x=self.full_xlim
+        if scale>1 and self.full_ylim is not None and abs(new_y[1]-new_y[0])>=abs(self.full_ylim[1]-self.full_ylim[0]):
+            new_y=self.full_ylim
+        self.ax.set_xlim(*new_x)
+        self.ax.set_ylim(*new_y)
+        self.canvas.draw_idle()
+
+    def _refresh_time_units(self):
+        self.update_table()
+        if self.result_window is not None and self.result_window.winfo_exists():
+            if hasattr(self,'_result_populate'):
+                self._result_populate()
+
+    def _time_display(self, t: float | None) -> str:
+        if t is None:return '—'
+        return f'{t*1000:.0f}' if self.unit_var.get()=='мкс' else f'{t:.3f}'
 
     def _normalized_signals(self) -> np.ndarray:
         assert self.record is not None
@@ -357,6 +581,8 @@ class PickerApp(tk.Tk):
         self.ax.tick_params(labelsize=9)
         self.ax.set_xlim(*bounds)
         self.ax.set_ylim(max_t,min_t)
+        self.full_xlim=bounds
+        self.full_ylim=(max_t,min_t)
         if keep_view:
             if old_xlim[1]>old_xlim[0] and old_ylim[0]>old_ylim[1]:
                 self.ax.set_xlim(old_xlim);self.ax.set_ylim(old_ylim)
@@ -379,6 +605,7 @@ class PickerApp(tk.Tk):
         self._changes('Последнее действие отменено')
 
     def _changes(self, msg: str):
+        self.unsaved_changes=True
         self.info_var.set(msg)
         self.update_table()
         self.draw_plot(keep_view=True)
@@ -496,6 +723,21 @@ class PickerApp(tk.Tk):
         return True
 
     def on_release(self,event):
+        if self._region_start is not None:
+            x0,y0=self._region_start
+            origin=self._region_origin
+            self._region_start=None
+            self._region_origin=None
+            if self._region_patch is not None:
+                self._region_patch.remove();self._region_patch=None
+            if event.inaxes is self.ax and event.xdata is not None and event.ydata is not None:
+                if origin is not None and np.hypot(event.x-origin[0],event.y-origin[1])>=12:
+                    x1,y1=float(event.xdata),float(event.ydata)
+                    if abs(x1-x0)>.05 and abs(y1-y0)>self.record.dt_us/1000*4:
+                        self.ax.set_xlim(min(x0,x1),max(x0,x1))
+                        self.ax.set_ylim(max(y0,y1),min(y0,y1))
+            self.canvas.draw_idle()
+            return
         trace=self.dragging_trace
         if trace is None:return
         was_active=self.drag_active
@@ -545,10 +787,11 @@ class PickerApp(tk.Tk):
         from tkinter import simpledialog
         value=simpledialog.askfloat('Изменить время',
             f'Приёмник №{self.record.headers[i].rcv_id}\n'
-            'Введите приблизительное время в миллисекундах.\n'
+            'Введите приблизительное время в '+self.unit_var.get()+'.\n'
             'Значение будет привязано к ближайшему экстремуму:',
-            initialvalue=self.record.time_ms(i,current),parent=self)
+            initialvalue=(self.record.time_ms(i,current)*(1000 if self.unit_var.get()=='мкс' else 1)),parent=self)
         if value is None:return
+        if self.unit_var.get()=='мкс':value/=1000
         guess=int(round((value-self.record.headers[i].delay_ms)*1000/self.record.dt_us))
         radius=int(round(self._radius_ms()*1000/self.record.dt_us))
         peak=extrema(self.display_signals[i], guess-radius, guess+radius, self.pol_var.get())
@@ -563,6 +806,13 @@ class PickerApp(tk.Tk):
         if not self.record or not self.state_model or event.inaxes is not self.ax:
             return
         if self.toolbar.mode:return
+        if event.button==1 and event.key and 'shift' in str(event.key).lower():
+            self._region_start=(float(event.xdata),float(event.ydata))
+            self._region_origin=(event.x,event.y)
+            self._region_patch=Rectangle(self._region_start,0,0,fill=False,
+                                         edgecolor='#1671aa',linewidth=1.5,linestyle='--',zorder=99)
+            self.ax.add_patch(self._region_patch)
+            return
         if event.button not in (1,3):return
         try:
             if event.button==3 or self.mode_var.get()=='erase':
@@ -588,6 +838,15 @@ class PickerApp(tk.Tk):
             messagebox.showerror('Параметры пика',str(e))
 
     def on_motion(self,event):
+        if self._region_start is not None:
+            if event.inaxes is self.ax and event.xdata is not None and event.ydata is not None:
+                x0,y0=self._region_start
+                self._region_patch.set_x(min(x0,event.xdata))
+                self._region_patch.set_y(min(y0,event.ydata))
+                self._region_patch.set_width(abs(event.xdata-x0))
+                self._region_patch.set_height(abs(event.ydata-y0))
+                self.canvas.draw_idle()
+            return
         if self.dragging_trace is not None and event.inaxes is self.ax and event.ydata is not None:
             self._motion_last = event
             if self.drag_press_y is not None and abs(event.y - self.drag_press_y) >= 4:
@@ -679,7 +938,7 @@ class PickerApp(tk.Tk):
             self.result_window.destroy()
         window=tk.Toplevel(self)
         self.result_window=window
-        window.title('Результаты пикирования · Travel time, мс')
+        window.title('Результаты пикирования · Travel time')
         ww, hh = 1080, 520
         self.update_idletasks()
         x = self.winfo_rootx() + max(0,(self.winfo_width()-ww)//2)
@@ -699,11 +958,19 @@ class PickerApp(tk.Tk):
                   f'Возможных несоответствий фазы: {len(warnings)}  |  '
                   'Пустое время означает отсутствие подтверждённого пика.',
                   foreground='#64748b').pack(anchor='w',pady=(5,0))
+        unit_bar=ttk.Frame(window,padding=(14,0,14,6));unit_bar.pack(fill='x')
+        ttk.Label(unit_bar,text='Отображение времени:').pack(side='left')
+        ttk.Radiobutton(unit_bar,text='мс',variable=self.unit_var,value='мс',
+                        command=self._refresh_time_units).pack(side='left',padx=(7,3))
+        ttk.Radiobutton(unit_bar,text='мкс',variable=self.unit_var,value='мкс',
+                        command=self._refresh_time_units).pack(side='left',padx=3)
+        ttk.Label(unit_bar,text='Экспорт TXT/CSV остаётся в миллисекундах',
+                  foreground='#64748b').pack(side='right')
         area=ttk.Frame(window,padding=(14,3));area.pack(fill='both',expand=True)
         keys=('SRC_ID','SRC_X','SRC_Z','RCV_ID','RCV_X','RCV_Z','Traveltime','Wave')
         tree=ttk.Treeview(area,columns=keys,show='headings',height=15)
         for key in keys:
-            label=key if key!='Traveltime' else 'Traveltime, мс'
+            label=key if key!='Traveltime' else 'Traveltime, '+self.unit_var.get()
             tree.heading(key,text=label)
             tree.column(key,width=130 if key=='Traveltime' else 100,anchor='center',stretch=True)
         tree.tag_configure('warning',background='#fff1dc')
@@ -716,13 +983,15 @@ class PickerApp(tk.Tk):
         area.rowconfigure(0,weight=1);area.columnconfigure(0,weight=1)
         show_all=tk.BooleanVar(value=False)
         def populate():
+            tree.heading('Traveltime',text='Traveltime, '+self.unit_var.get())
             for child in tree.get_children():tree.delete(child)
             for i, h in enumerate(self.record.headers):
                 if i not in self.state_model.picks and not show_all.get():continue
                 tt=self.record.time_ms(i,self.state_model.picks[i]) if i in self.state_model.picks else None
                 values=(h.src_id,f'{h.src_x:g}',0,h.rcv_id,f'{h.rcv_x:g}',0,
-                        f'{tt:.3f}' if tt is not None else '',0)
+                        self._time_display(tt) if tt is not None else '',0)
                 tree.insert('','end',values=values,tags=('warning',) if i in warnings else ())
+        self._result_populate=populate
         populate()
         foot=ttk.Frame(window,padding=(14,12));foot.pack(fill='x')
         ttk.Checkbutton(foot,text='Показывать все приёмники',variable=show_all,
@@ -730,7 +999,14 @@ class PickerApp(tk.Tk):
         def copy_table():
             rows=self.state_model.rows(all_traces=show_all.get())
             from .picking import _format
-            text='\t'.join(keys)+'\n'+'\n'.join('\t'.join(_format(v) for v in row) for row in rows)
+            header=list(keys)
+            header[6]='Traveltime_us' if self.unit_var.get()=='мкс' else 'Traveltime_ms'
+            copied=[]
+            for row in rows:
+                converted=list(row)
+                converted[6] = float(converted[6])*1000 if converted[6] is not None and self.unit_var.get()=='мкс' else converted[6]
+                copied.append('\t'.join(_format(v) for v in converted))
+            text='\t'.join(header)+'\n'+'\n'.join(copied)
             window.clipboard_clear();window.clipboard_append(text)
             self.info_var.set(f'Скопировано {len(rows)} строк в буфер обмена')
         ttk.Button(foot,text='Копировать таблицу',command=copy_table).pack(side='right',padx=4)
@@ -742,18 +1018,19 @@ class PickerApp(tk.Tk):
         if self.state_model.picks:
             first=str(min(self.state_model.picks))
             if self.table.exists(first):self.table.see(first)
-        self.info_var.set(f'Рассчитано {n} значений Travel time в миллисекундах; открыта таблица результатов.')
+        self.info_var.set(f'Рассчитано {n} значений Travel time; открыта таблица результатов.')
 
     def update_table(self):
         state=self.state_model
         for row in self.table.get_children():self.table.delete(row)
         if state is None:return
+        self.table.heading('time',text='Travel time, '+self.unit_var.get())
         warnings = audit_picks(state.record, state.picks, self._tolerance_ms())
         for i,h in enumerate(state.record.headers):
             picked=i in state.picks; suggestion=i in state.proposals
             if not self.show_all_var.get() and not (picked or suggestion):continue
             sample=state.picks.get(i,state.proposals.get(i))
-            time_ms=f'{state.record.time_ms(i,sample):.3f}' if sample is not None else '—'
+            time_ms=self._time_display(state.record.time_ms(i,sample) if sample is not None else None)
             detail=state.proposal_info.get(i)
             quality=detail.quality if detail is not None else '—'
             kind='⚠ Фаза?' if i in warnings else 'Готово' if picked else 'Предложено' if suggestion else '—'
@@ -773,32 +1050,78 @@ class PickerApp(tk.Tk):
                 h=self.record.headers[self.selected_trace]
                 self.info_var.set(f'Выбран приёмник №{h.rcv_id}, X={h.rcv_x:g} м')
 
+    def save_workspace(self):
+        """Save all opened files' picks, pending proposals and zoom in one JSON."""
+        if not self.sessions.entries:return
+        self._store_session()
+        path=filedialog.asksaveasfilename(title='Сохранить все сейсмограммы',
+            defaultextension='.stp-session.json',initialfile='seismic_session.stp-session.json',
+            filetypes=[('Сеанс сейсмограмм (*.json)','*.json')])
+        if not path:return
+        try:
+            self.sessions.save(path,self.current_path)
+            self.workspace_path=Path(path).resolve()
+            for entry in self.sessions.entries.values():entry.dirty=False
+            self.unsaved_changes=False
+            self.info_var.set(f'Сохранён сеанс из {len(self.sessions.entries)} SGY: {path}')
+        except (OSError,ValueError) as exc:
+            messagebox.showerror('Ошибка сохранения сеанса',str(exc))
+
     def save_project(self):
         if not self.state_model:return
+        if len(self.sessions.entries)>1:
+            self.save_workspace()
+            return
         path=filedialog.asksaveasfilename(title='Сохранить проект',defaultextension='.stp.json',
              filetypes=[('Проект пикирования','*.json')],initialfile=self.record.path.stem+'.stp.json')
         if path:
-            try:self.state_model.save_project(path);self.unsaved_changes=False;self.info_var.set('Проект сохранён: '+path)
+            try:
+                self.state_model.save_project(path)
+                self.unsaved_changes=False
+                self.sessions.entries[self.current_path].dirty=False
+                self.info_var.set('Проект сохранён: '+path)
             except OSError as e:messagebox.showerror('Сохранение',str(e))
 
     def open_project(self):
-        path=filedialog.askopenfilename(title='Открыть проект',filetypes=[('Проекты JSON','*.json')])
+        path=filedialog.askopenfilename(title='Открыть проект или сеанс',filetypes=[('Проекты JSON','*.json')])
         if not path:return
-        if not self.confirm_discard():return
         try:
             import json
             data=json.loads(Path(path).read_text(encoding='utf-8'))
+            if data.get('schema_version')==2:
+                if not self.confirm_discard():return
+                library,current=SessionLibrary.load(path)
+                missing=[p.name for p in library.entries if not p.is_file()]
+                if missing:
+                    messagebox.showerror('Недоступные файлы',
+                        'Не найдены исходные SEG-Y: '+', '.join(missing[:8])+
+                        '. Разместите файлы по исходным путям и откройте сеанс снова.')
+                    return
+                # Validate target file before replacing the current workspace.
+                if current is None:return
+                record=read_segy(current)
+                library.entries[current].validate_record(record)
+                self.sessions=library
+                self.current_path=None
+                self.record=None
+                self.state_model=None
+                self.workspace_path=Path(path).resolve()
+                self.activate_file(current)
+                self.info_var.set(f'Восстановлен сеанс: {len(library.entries)} SGY')
+                return
             source=data['source_path']
             if not Path(source).is_file():
-                source=filedialog.askopenfilename(title='Укажите SEG-Y, соответствующий проекту',filetypes=[('SEG-Y','*.sgy *.segy'),('Все','*.*')])
+                source=filedialog.askopenfilename(title='Укажите SEG-Y, соответствующий проекту',
+                         filetypes=[('SEG-Y','*.sgy *.segy'),('Все','*.*')])
             if not source:return
-            if self.record is None or Path(source).resolve()!=self.record.path:
-                if not self.load_file(source):return
+            if not self.load_file(source):return
             self.state_model.load_project(path)
             self.history.clear()
             self.unsaved_changes=False
+            self.sessions.entries[self.current_path].dirty=False
             self._changes('Проект загружен: '+path)
-        except (OSError,ValueError,KeyError) as e:
+            self.unsaved_changes=False
+        except (OSError,ValueError,KeyError,TypeError) as e:
             messagebox.showerror('Не удалось открыть проект',str(e))
 
     def export(self,fmt):
@@ -835,10 +1158,12 @@ class PickerApp(tk.Tk):
         except OSError as e:messagebox.showerror('Ошибка',str(e))
 
     def confirm_discard(self) -> bool:
-        if not self.unsaved_changes or not self.state_model or not self.state_model.picks:
-            return True
-        return messagebox.askyesno('Несохранённые точки',
-            'Есть несохранённые изменения пикирования. Продолжить без сохранения проекта?')
+        self._store_session()
+        dirty=sum(session.dirty for session in self.sessions.entries.values())
+        if not dirty:return True
+        return messagebox.askyesno('Несохранённые изменения',
+            f'Есть несохранённые изменения в {dirty} сейсмограммах.\n'
+            'Закрыть без сохранения? Для сохранения всех файлов выберите «Сохранить проект».')
 
     def on_close(self) -> None:
         if self.confirm_discard():
@@ -846,8 +1171,8 @@ class PickerApp(tk.Tk):
 
     def help_dialog(self):
         messagebox.showinfo('Краткая инструкция',
-            '1. Открой SEG-Y / SGY.\n'
-            '2. Увеличь нужный участок инструментом лупы снизу.\n'
+            '1. Выберите один или несколько SEG-Y / SGY; переключайте их вверху окна.\n'
+            '2. Колёсико мыши увеличивает участок под курсором; Shift+перетаскивание выделяет область.\n'
             '3. Верни режим лупы в обычный и щёлкай вершины чёрных пиков.\n'
             '4. Жёлтая точка — пик, зелёная — горизонтальная проекция на ось трассы.\n'
             '   Чтобы перенести пик, перетащи жёлтую или зелёную точку вверх/вниз.\n'
@@ -856,7 +1181,8 @@ class PickerApp(tk.Tk):
             '   Красные предложения — повод дополнительно проверить фазу.\n'
             '6. Проверь предложенные пики до подтверждения; при ошибке добавь опорные\n'
             '   точки и запусти прослеживание заново. Затем рассчитай Travel time.\n'
-            '7. Экспортируй TXT или CSV, сохрани проект для правок.\n\n'
+            '7. Переключатель мс/мкс меняет только отображение таблиц; экспорт в мс.\n'
+            '   Для нескольких SGY «Сохранить проект» сохраняет весь сеанс.\n\n'
             'При пересечении кривых можно выбрать приёмник в таблице и включить привязку только к нему.\n'
             'Правый клик удаляет пик; Ctrl+Z отменяет действие.\n'
             'При скачке времени появится вопрос, не перепутана ли фаза.\n'
