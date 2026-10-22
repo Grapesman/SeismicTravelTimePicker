@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       publish_release:
-        description: "Publish or update v0.3.0 in Releases with Windows EXE"
+        description: "Publish or update v0.4.0 in Releases with Windows EXE"
         type: boolean
         required: true
         default: false
@@ -36,7 +36,7 @@ jobs:
         run: python -m pytest -q
 
       - name: Build standalone EXE
-        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name SeismicTravelTimePicker main.py
+        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name SeismicTravelTimePicker --icon assets/seispeak_icon.ico --add-data "assets/seispeak_icon.png;assets" main.py
 
       - name: Verify EXE exists
         shell: pwsh
@@ -69,10 +69,10 @@ jobs:
           name: SeismicTravelTimePicker-Windows
           path: release
 
-      - name: Publish or update v0.3.0 release
+      - name: Publish or update v0.4.0 release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: v0.3.0
+          TAG: v0.4.0
         shell: bash
         run: |
           set -euo pipefail
@@ -83,6 +83,6 @@ jobs:
           else
             gh release create "$TAG" "$asset" \
               --target "$GITHUB_SHA" \
-              --title "Seismic TravelTime Picker v0.3.0" \
+              --title "Seismic TravelTime Picker v0.4.0" \
               --notes-file RELEASE_NOTES.md
           fi
