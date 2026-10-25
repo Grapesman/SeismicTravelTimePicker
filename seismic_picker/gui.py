@@ -19,6 +19,7 @@ from . import __version__
 from .segy import read_segy, SeismicRecord, SegyError
 from .picking import PickerState, extrema
 from .qc import audit_picks, check_phase_continuity
+from .picking import export_table
 
 
 class PickerApp(tk.Tk):
@@ -124,7 +125,7 @@ class PickerApp(tk.Tk):
         fm.add_command(label='Сохранить проект...  Ctrl+S', command=self.save_project)
         fm.add_separator()
         fm.add_command(label='Экспорт TXT...', command=lambda: self.export('txt'))
-        fm.add_command(label='Экспорт TXT всех открытых SGY...', command=self.export_all)
+        fm.add_command(label='Общий TXT по всем SGY...', command=self.export_all)
         fm.add_command(label='Экспорт CSV...', command=lambda: self.export('csv'))
         fm.add_command(label='Сохранить изображение...', command=self.export_image)
         fm.add_separator(); fm.add_command(label='Выход', command=self.on_close)
@@ -156,6 +157,7 @@ class PickerApp(tk.Tk):
         ttk.Button(bar, text='📂  Открыть SGY', style='Primary.TButton', command=self.open_file).pack(side='left', padx=(0,5))
         ttk.Button(bar, text='Сохранить проект', command=self.save_project).pack(side='left', padx=5)
         ttk.Button(bar, text='Экспорт TXT', command=lambda: self.export('txt')).pack(side='left', padx=5)
+        ttk.Button(bar, text='Общий TXT', command=self.export_all).pack(side='left', padx=5)
         ttk.Separator(bar, orient='vertical').pack(side='left', fill='y', padx=8)
         ttk.Button(bar, text='Отменить', command=self.undo).pack(side='left', padx=3)
         ttk.Button(bar, text='Удалить точку', command=self.delete_selected).pack(side='left', padx=3)
@@ -170,6 +172,8 @@ class PickerApp(tk.Tk):
         ttk.Checkbutton(bar, text='AGC', variable=self.agc_var, command=self.request_redraw).pack(side='left', padx=8)
         ttk.Checkbutton(bar, text='Цвет', variable=self.color_var, command=self.request_redraw).pack(side='left')
         ttk.Checkbutton(bar, text='Проекции', variable=self.show_guides_var, command=self.request_redraw).pack(side='left',padx=8)
+        ttk.Checkbutton(bar, text='Предупреждать о скачке',
+                        variable=self.phase_warning_var).pack(side='left',padx=8)
         ttk.Button(bar, text='Сброс масштаба', command=self.reset_view).pack(side='right')
 
         # A separate thin navigation row remains usable on 1100-pixel displays.
@@ -344,36 +348,37 @@ class PickerApp(tk.Tk):
         self.info_var.set(f'Добавлено {len(added)} файлов из папки; всего: {len(self.sessions.entries)}.')
 
     def export_all(self):
-        """Separate TXT files for touched records only, without writing unverified proposals."""
+        """One merged TXT containing only confirmed picks, sourced from each SGY header."""
         self._store_session()
         ready=[entry for entry in self.sessions.entries.values() if entry.picks]
         if not ready:
-            messagebox.showinfo('Пакетный экспорт','Нет ни одного SGY с подтверждёнными пиками.');return
-        folder=filedialog.askdirectory(title='Папка для результатов всех SGY')
-        if not folder:return
-        output=Path(folder)
-        exported=[];failures=[]
+            messagebox.showinfo('Общий экспорт','Нет SGY с подтверждёнными пиками.');return
+        target=filedialog.asksaveasfilename(title='Сохранить общий TXT по всем сейсмограммам',
+                 defaultextension='.txt', initialfile='SeisPeak_all_traveltimes.txt',
+                 filetypes=[('Текстовые файлы','*.txt')])
+        if not target:return
+        rows=[]
+        failures=[]
         for session in ready:
             try:
                 rec=read_segy(session.path)
                 session.validate_record(rec)
-                name=session.path.stem+'_traveltime.txt'
-                dest=output/name
-                suffix=2
-                while dest.exists():
-                    dest=output/(session.path.stem+f'_traveltime_{suffix}.txt')
-                    suffix+=1
                 picker=PickerState(rec,picks=session.picks.copy())
-                picker.export_txt(dest)
-                exported.append(dest.name)
+                rows.extend(picker.rows(all_traces=False))
             except (OSError,ValueError,SegyError) as exc:
                 failures.append(f'{session.path.name}: {exc}')
-        msg=f'Сохранено {len(exported)} текстовых файлов в {output}.'
         if failures:
-            msg+=f'\nОшибок: {len(failures)}\n'+'\n'.join(failures[:5])
-            messagebox.showwarning('Пакетный экспорт',msg)
-        else:messagebox.showinfo('Пакетный экспорт',msg)
-        self.info_var.set(msg.split('\n')[0])
+            messagebox.showerror('Общий экспорт',
+                  'Не удалось проверить все SGY. Файл не создан.\n\n'+'\n'.join(failures[:8]))
+            return
+        try:
+            export_table(target,rows,delimiter='\t')
+        except OSError as exc:
+            messagebox.showerror('Общий экспорт',f'Не удалось сохранить файл: {exc}')
+            return
+        msg=f'Сохранён один TXT: {len(ready)} сейсмограмм, {len(rows)} подтверждённых пиков.'
+        self.info_var.set(msg)
+        messagebox.showinfo('Общий экспорт',msg+'\n\n'+str(target))
 
     def _store_session(self):
         """Store every editable UI field without holding extra SEG-Y arrays in RAM."""
