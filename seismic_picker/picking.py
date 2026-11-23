@@ -162,6 +162,8 @@ def sha256(path: Path) -> str:
 def _format(v) -> str:
     if v is None:
         return ''
+    if isinstance(v, str):
+        return v
     if isinstance(v, (int, np.integer)):
         return str(int(v))
     return f'{float(v):.6f}'.rstrip('0').rstrip('.') or '0'

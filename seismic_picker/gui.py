@@ -4,28 +4,32 @@ import copy
 import sys
 from pathlib import Path
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog, colorchooser
 
 import numpy as np
 import matplotlib
 matplotlib.use('TkAgg')
 from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.ticker import MultipleLocator
 from matplotlib.patches import Rectangle
 from .workspace import SessionLibrary
 
 from . import __version__
-from .segy import read_segy, SeismicRecord, SegyError
+from .segy import read_segy, read_segy_headers, SeismicRecord, SegyError
 from .picking import PickerState, extrema
 from .qc import audit_picks, check_phase_continuity
-from .picking import export_table
+from .picking import export_table, nearest_peak
+from .waves import WaveLayer, WaveType, wave_color, valid_code, rows_for_layer
+from .importer import read_pick_file, validate_pick_import
+from .hodograph import from_workspace, geometry_relation
+from .tooltips import ToolTip
 
 
 class PickerApp(tk.Tk):
     def __init__(self, initial_file: str | None = None):
         super().__init__()
-        self.title(f'SeisPeak  •  Seismic TravelTime Picker  •  {__version__}')
+        self.title(f'Pic Editor (PE)  •  SEG-Y Picker  •  {__version__}')
         self.geometry('1550x930')
         self.minsize(1100, 680)
         self.configure(bg='#f3f6fb')
@@ -33,7 +37,7 @@ class PickerApp(tk.Tk):
         self._app_icon = None
         try:
             base_path = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent.parent))
-            icon_file = base_path / 'assets' / 'seispeak_icon.png'
+            icon_file = base_path / 'assets' / 'pic_editor_icon.png'
             if icon_file.is_file():
                 self._app_icon = tk.PhotoImage(file=str(icon_file))
                 self.iconphoto(True, self._app_icon)
@@ -64,6 +68,16 @@ class PickerApp(tk.Tk):
         self.phase_tolerance_var = tk.StringVar(value='8')
         self.show_guides_var = tk.BooleanVar(value=True)
         self.show_grid_var = tk.BooleanVar(value=True)
+        self.current_wave_code = '0'
+        self.wave_code_var = tk.StringVar(value='0')
+        self.auto_interp_var = tk.BooleanVar(value=True)
+        self._wave_selector_codes: list[str] = []
+        self._setting_visible = False
+        self._pan_origin = None
+        self._pan_active = False
+        self._hodo_point_lookup = {}
+        self._hodo_drag = None
+        self._hodo_hover = None
         self.dragging_trace: int | None = None
         self.drag_press_y: float | None = None
         self.drag_artist = None
@@ -83,6 +97,8 @@ class PickerApp(tk.Tk):
         self.full_xlim = None
         self.full_ylim = None
         self._make_ui()
+        self._attach_tooltips()
+        self.after(100,self._show_splash)
         self.bind('<Control-Next>',lambda e:self.shift_file(1))
         self.bind('<Control-Prior>',lambda e:self.shift_file(-1))
         self.bind('<Control-o>', lambda e: self.open_file())
@@ -121,6 +137,7 @@ class PickerApp(tk.Tk):
         fm.add_command(label='Открыть SEG-Y...  Ctrl+O', command=self.open_file)
         fm.add_command(label='Добавить папку с SGY...',command=self.open_folder)
         fm.add_command(label='Открыть проект / сеанс...', command=self.open_project)
+        fm.add_command(label='Импорт SGY + TXT (восстановить пики)...',command=self.import_from_txt)
         fm.add_command(label='Сохранить все сейсмограммы...', command=self.save_workspace)
         fm.add_command(label='Сохранить проект...  Ctrl+S', command=self.save_project)
         fm.add_separator()
@@ -141,40 +158,41 @@ class PickerApp(tk.Tk):
         info = tk.Menu(menu, tearoff=0)
         info.add_command(label='Инструкция', command=self.help_dialog)
         info.add_command(label='О программе', command=lambda: messagebox.showinfo('О программе',
-            'SeisPeak · Seismic TravelTime Picker v'+__version__+'\nТочное ручное пикирование по отсчётам SEG-Y.\nПрототип; необходима дополнительная проверка перед промышленным применением.'))
+            'Pic Editor (PE) · SEG-Y Picker v'+__version__+'\nТочное ручное пикирование по отсчётам SEG-Y.\nПрототип; необходима дополнительная проверка перед промышленным применением.'))
         menu.add_cascade(label='Помощь', menu=info)
         self.config(menu=menu)
 
         brand = tk.Frame(self, bg='#103b5a', height=48)
         brand.pack(fill='x')
-        tk.Label(brand, text='◈  SEISMIC  /  TRAVEL TIME PICKER', bg='#103b5a', fg='#ffffff',
+        tk.Label(brand, text='◈  PE  /  PIC EDITOR', bg='#103b5a', fg='#ffffff',
                  font=('Helvetica Neue', 14, 'bold') if sys.platform == 'darwin' else ('Segoe UI', 13, 'bold'),
                  padx=16).pack(side='left', pady=11)
-        tk.Label(brand, text=f'VERSION {__version__}   •   РУЧНОЕ ПИКИРОВАНИЕ SEG-Y',
+        tk.Label(brand, text=f'VERSION {__version__}   •   ПИКИРОВАНИЕ И ГОДОГРАФЫ',
                  bg='#103b5a', fg='#b4d2e8', font=font_main, padx=14).pack(side='right')
         bar = ttk.Frame(self, padding=(13,9))
         bar.pack(fill='x')
         ttk.Button(bar, text='📂  Открыть SGY', style='Primary.TButton', command=self.open_file).pack(side='left', padx=(0,5))
         ttk.Button(bar, text='Сохранить проект', command=self.save_project).pack(side='left', padx=5)
         ttk.Button(bar, text='Экспорт TXT', command=lambda: self.export('txt')).pack(side='left', padx=5)
+        ttk.Button(bar, text='Импорт TXT', command=self.import_from_txt).pack(side='left', padx=5)
         ttk.Button(bar, text='Общий TXT', command=self.export_all).pack(side='left', padx=5)
         ttk.Separator(bar, orient='vertical').pack(side='left', fill='y', padx=8)
         ttk.Button(bar, text='Отменить', command=self.undo).pack(side='left', padx=3)
         ttk.Button(bar, text='Удалить точку', command=self.delete_selected).pack(side='left', padx=3)
-        ttk.Button(bar, text='▶ Проследить фазу', style='Primary.TButton', command=self.propose_phase).pack(side='left', padx=6)
-        ttk.Label(bar, text='  Усиление', foreground='#334155').pack(side='left', padx=(14,3))
-        ttk.Button(bar, text='−', width=2, command=lambda: self.change_gain(-0.1)).pack(side='left',padx=(2,0))
-        self.gain_slider = ttk.Scale(bar, from_=0.2, to=3, variable=self.gain_var,
+        viewbar=ttk.Frame(self,padding=(13,0,13,4));viewbar.pack(fill='x')
+        ttk.Label(viewbar, text='  Усиление', foreground='#334155').pack(side='left', padx=(14,3))
+        ttk.Button(viewbar, text='−', width=2, command=lambda: self.change_gain(-0.1)).pack(side='left',padx=(2,0))
+        self.gain_slider = ttk.Scale(viewbar, from_=0.2, to=3, variable=self.gain_var,
                   orient='horizontal', length=95, command=lambda _v: self.request_redraw())
         self.gain_slider.pack(side='left')
-        ttk.Button(bar, text='+', width=2, command=lambda: self.change_gain(0.1)).pack(side='left',padx=(0,2))
-        ttk.Label(bar,textvariable=self.gain_label_var,foreground='#475569').pack(side='left',padx=(1,2))
-        ttk.Checkbutton(bar, text='AGC', variable=self.agc_var, command=self.request_redraw).pack(side='left', padx=8)
-        ttk.Checkbutton(bar, text='Цвет', variable=self.color_var, command=self.request_redraw).pack(side='left')
-        ttk.Checkbutton(bar, text='Проекции', variable=self.show_guides_var, command=self.request_redraw).pack(side='left',padx=8)
-        ttk.Checkbutton(bar, text='Предупреждать о скачке',
+        ttk.Button(viewbar, text='+', width=2, command=lambda: self.change_gain(0.1)).pack(side='left',padx=(0,2))
+        ttk.Label(viewbar,textvariable=self.gain_label_var,foreground='#475569').pack(side='left',padx=(1,2))
+        ttk.Checkbutton(viewbar, text='AGC', variable=self.agc_var, command=self.request_redraw).pack(side='left', padx=8)
+        ttk.Checkbutton(viewbar, text='Цвет', variable=self.color_var, command=self.request_redraw).pack(side='left')
+        ttk.Checkbutton(viewbar, text='Проекции', variable=self.show_guides_var, command=self.request_redraw).pack(side='left',padx=8)
+        ttk.Checkbutton(viewbar, text='Предупреждать о скачке',
                         variable=self.phase_warning_var).pack(side='left',padx=8)
-        ttk.Button(bar, text='Сброс масштаба', command=self.reset_view).pack(side='right')
+        ttk.Button(viewbar, text='Сброс масштаба', command=self.reset_view).pack(side='right')
 
         # A separate thin navigation row remains usable on 1100-pixel displays.
         files_bar=ttk.Frame(self, padding=(13,0,13,7));files_bar.pack(fill='x')
@@ -187,10 +205,16 @@ class PickerApp(tk.Tk):
         ttk.Button(files_bar,text='▶',width=3,command=lambda:self.shift_file(1)).pack(side='left',padx=2)
         self.file_counter=ttk.Label(files_bar,text='0 / 0',foreground='#475569')
         self.file_counter.pack(side='left',padx=(8,0))
-        ttk.Label(files_bar,text='Колесо: зум · Shift + протянуть: выделить область',
+        ttk.Label(files_bar,text='Колесо: XY · Shift+колесо: Y · Ctrl+колесо: X · ЛКМ по фону: перетаскивание',
                   foreground='#64748b').pack(side='right',padx=(14,0))
 
-        body = ttk.Panedwindow(self, orient='horizontal'); body.pack(fill='both',expand=True, padx=10,pady=(0,4))
+        self.worktabs=ttk.Notebook(self)
+        self.worktabs.pack(fill='both',expand=True,padx=8,pady=(0,4))
+        main_page=ttk.Frame(self.worktabs)
+        self.hodo_page=ttk.Frame(self.worktabs)
+        self.worktabs.add(main_page,text='  Сейсмограмма  ')
+        self.worktabs.add(self.hodo_page,text='  Годограф — развёрнутый  ')
+        body = ttk.Panedwindow(main_page, orient='horizontal'); body.pack(fill='both',expand=True, padx=2,pady=(0,4))
         plot_frame = ttk.Frame(body)
         body.add(plot_frame, weight=5)
         tools = ttk.Frame(body, padding=(15,12))
@@ -200,8 +224,6 @@ class PickerApp(tk.Tk):
         self.ax = self.fig.add_axes([0.07,0.075,0.91,0.89])
         self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
         self.canvas.get_tk_widget().pack(side='top',fill='both',expand=True)
-        self.toolbar = NavigationToolbar2Tk(self.canvas, plot_frame, pack_toolbar=False)
-        self.toolbar.update(); self.toolbar.pack(side='bottom',fill='x')
         self.canvas.mpl_connect('button_press_event', self.on_click)
         self.canvas.mpl_connect('motion_notify_event', self.on_motion)
         self.canvas.mpl_connect('button_release_event', self.on_release)
@@ -211,13 +233,40 @@ class PickerApp(tk.Tk):
         self.ax.set_xticks([]); self.ax.set_yticks([])
         self.canvas.draw_idle()
 
-        ttk.Label(tools, text='ПИКИРОВАНИЕ ВОЛНЫ',
-                  font=('Helvetica Neue', 13, 'bold') if sys.platform == 'darwin' else ('Segoe UI', 12, 'bold'),
-                  foreground='#174569').pack(anchor='w',pady=(0,4))
-        ttk.Label(tools, text='Отметьте вершины одной фазы на соседних трассах.',
-                  foreground='#5b7083').pack(anchor='w',pady=(0,12))
-        self.control_tabs=ttk.Notebook(tools)
-        self.control_tabs.pack(fill='x',pady=(0,8))
+        hodo_frame=ttk.LabelFrame(tools,text='ГОДОГРАФ · все загруженные SGY',padding=(4,3))
+        hodo_frame.pack(fill='x',pady=(0,6))
+        self.hodo_mini_fig=Figure(figsize=(4,1.95),dpi=95,facecolor='#ffffff')
+        self.hodo_mini_ax=self.hodo_mini_fig.add_axes([.12,.18,.84,.75])
+        self.hodo_mini_canvas=FigureCanvasTkAgg(self.hodo_mini_fig,master=hodo_frame)
+        self.hodo_mini_canvas.get_tk_widget().pack(fill='x')
+        ttk.Button(hodo_frame,text='⤢  Развернуть годограф',command=self.open_full_hodo).pack(anchor='e',pady=(2,0))
+
+        self.hodo_full_fig=Figure(figsize=(10,7),dpi=100,facecolor='white')
+        self.hodo_full_ax=self.hodo_full_fig.add_axes([.1,.12,.85,.82])
+        ttk.Button(self.hodo_page,text='◀  Вернуться к сейсмограмме',
+                   command=lambda:self.worktabs.select(0)).pack(anchor='w',padx=8,pady=5)
+        self.hodo_full_canvas=FigureCanvasTkAgg(self.hodo_full_fig,master=self.hodo_page)
+        self.hodo_full_canvas.get_tk_widget().pack(fill='both',expand=True)
+        for canv,ax in [(self.hodo_mini_canvas,self.hodo_mini_ax),
+                        (self.hodo_full_canvas,self.hodo_full_ax)]:
+            canv.mpl_connect('button_press_event',lambda evt,c=canv,a=ax:self.hodo_press(evt,c,a))
+            canv.mpl_connect('motion_notify_event',lambda evt,c=canv,a=ax:self.hodo_motion(evt,c,a))
+            canv.mpl_connect('button_release_event',lambda evt,c=canv,a=ax:self.hodo_release(evt,c,a))
+
+        wave_row=ttk.Frame(tools);wave_row.pack(fill='x',pady=(0,4))
+        ttk.Label(wave_row,text='Волна:').pack(side='left',padx=(0,5))
+        self.wave_selector=ttk.Combobox(wave_row,state='readonly',textvariable=self.wave_code_var,width=17)
+        self.wave_selector.pack(side='left',fill='x',expand=True)
+        self.wave_selector.bind('<<ComboboxSelected>>',self._on_wave_selected)
+        ttk.Button(wave_row,text='+ Волна',command=self.create_wave_dialog).pack(side='left',padx=3)
+        ttk.Button(wave_row,text='Палитра',command=self.edit_wave_dialog).pack(side='left',padx=3)
+        self._refresh_wave_selector()
+
+        self.settings_toggle=ttk.Button(tools,text='⚙ Настройки пикирования  ▾',command=self.toggle_settings)
+        self.settings_toggle.pack(fill='x',pady=(0,3))
+        self.settings_holder=ttk.Frame(tools)
+        self.control_tabs=ttk.Notebook(self.settings_holder)
+        self.control_tabs.pack(fill='x',pady=(0,5))
         pick_page=ttk.Frame(self.control_tabs,padding=(6,7))
         qc_page=ttk.Frame(self.control_tabs,padding=(6,7))
         track_page=ttk.Frame(self.control_tabs,padding=(6,7))
@@ -257,6 +306,7 @@ class PickerApp(tk.Tk):
         ttk.Entry(rr,textvariable=self.tracking_radius_var,width=7).pack(side='left',padx=8)
         ttk.Button(track_box,text='▶  Проследить фазу между опорами  Ctrl+P',
                    style='Primary.TButton',command=self.propose_phase).pack(fill='x',pady=2)
+        ttk.Checkbutton(track_box,text='Автоинтерполяция между опорами',variable=self.auto_interp_var).pack(anchor='w',pady=4)
         ttk.Label(track_box,text='Оценка качества — ориентир для проверки, не вероятность.',
                   foreground='#64748b',wraplength=320).pack(anchor='w',pady=(3,0))
         block=ttk.LabelFrame(tools,text='Расчёт и экспорт',padding=7);block.pack(fill='x',pady=(0,7))
@@ -293,6 +343,359 @@ class PickerApp(tk.Tk):
         status=ttk.Frame(self,padding=(10,5));status.pack(fill='x')
         ttk.Label(status,textvariable=self.info_var,foreground='#153c5a').pack(side='left')
         ttk.Label(status,textvariable=self.stats_var,foreground='#64748b').pack(side='right')
+
+    def _show_splash(self):
+        """Non-blocking startup brand splash; does not affect data handling."""
+        try:
+            window=tk.Toplevel(self)
+            window.overrideredirect(True)
+            window.configure(bg='#08192b')
+            w,h=300,340
+            x=self.winfo_rootx()+max(0,(self.winfo_width()-w)//2)
+            y=self.winfo_rooty()+max(0,(self.winfo_height()-h)//2)
+            window.geometry(f'{w}x{h}+{x}+{y}')
+            window.lift()
+            base=Path(getattr(sys,'_MEIPASS',Path(__file__).resolve().parent.parent))
+            file=base/'assets'/'pic_editor_icon.png'
+            self._splash_icon=tk.PhotoImage(file=str(file)) if file.exists() else None
+            if self._splash_icon is not None:
+                tk.Label(window,image=self._splash_icon,bg='#08192b').pack(padx=20,pady=(16,5))
+            tk.Label(window,text='PIC EDITOR  ·  PE',bg='#08192b',fg='white',
+                     font=('Segoe UI',15,'bold')).pack(pady=(1,5))
+            tk.Label(window,text='SEG-Y  |  PICKING  |  HODOGRAPHS',bg='#08192b',
+                     fg='#60d8ef',font=('Segoe UI',9)).pack()
+            window.after(1150,window.destroy)
+        except (OSError,tk.TclError):pass
+
+    def _active_wave(self) -> str:
+        return getattr(self,'current_wave_code','0')
+
+    def _refresh_wave_selector(self):
+        if not hasattr(self,'wave_selector'):return
+        self._wave_selector_codes=list(self.sessions.wave_types)
+        self.wave_selector['values']=[f'{code} · {self.sessions.wave_types[code].name}'
+                                      for code in self._wave_selector_codes]
+        code=self._active_wave()
+        if code in self._wave_selector_codes:
+            self.wave_selector.current(self._wave_selector_codes.index(code))
+
+    def _on_wave_selected(self,_event=None):
+        index=self.wave_selector.current()
+        if 0<=index<len(self._wave_selector_codes):
+            self.switch_wave(self._wave_selector_codes[index])
+
+    def switch_wave(self,code:str):
+        code=valid_code(code)
+        if code not in self.sessions.wave_types:return
+        if self.state_model and self.record and self.current_path:
+            if self._active_wave()==code:
+                self._refresh_wave_selector();return
+            self._store_session()
+        self.current_wave_code=code
+        if self.record is not None and self.current_path in self.sessions.entries:
+            session=self.sessions.entries[self.current_path]
+            session.active_wave=code
+            layer=session.layer(code)
+            state=PickerState(self.record)
+            state.picks=layer.picks.copy()
+            state.proposals=layer.proposals.copy()
+            state.proposal_info=layer.proposal_info.copy()
+            state.failed_intervals=layer.failed_intervals
+            self.state_model=state
+            self.history=[snap.copy() for snap in layer.history]
+            self.selected_trace=layer.selected_trace
+            self.draw_plot(keep_view=True)
+            self.update_table()
+            self.refresh_hodographs()
+            self.info_var.set(f'Активная волна: {code} — {self.sessions.wave_types[code].name}.')
+        self._refresh_wave_selector()
+
+    def _wave_dialog(self,edit:bool=False):
+        current=self.sessions.wave_types.get(self._active_wave(),WaveType())
+        dlg=tk.Toplevel(self)
+        dlg.title('Палитра волны' if edit else 'Новая волна')
+        dlg.geometry('430x310')
+        dlg.transient(self)
+        dlg.grab_set()
+        holder=ttk.Frame(dlg,padding=18)
+        holder.pack(fill='both',expand=True)
+        code_var=tk.StringVar(value=current.code if edit else '')
+        name_var=tk.StringVar(value=current.name if edit else '')
+        colors={'line_color':current.line_color if edit else wave_color(len(self.sessions.wave_types)),
+                'peak_color':current.peak_color,'guide_color':current.guide_color}
+        ttk.Label(holder,text='Код Wave (цифры или буквы):').grid(row=0,column=0,sticky='w',pady=6)
+        code_entry=ttk.Entry(holder,textvariable=code_var,width=24)
+        code_entry.grid(row=0,column=1,sticky='ew',pady=6)
+        if edit:code_entry.configure(state='disabled')
+        ttk.Label(holder,text='Название волны:').grid(row=1,column=0,sticky='w',pady=6)
+        ttk.Entry(holder,textvariable=name_var).grid(row=1,column=1,sticky='ew',pady=6)
+        for row,(key,label) in enumerate([('line_color','Линия годографа'),
+                                          ('peak_color','Точки пиков'),
+                                          ('guide_color','Проекции')],start=2):
+            ttk.Label(holder,text=label+':').grid(row=row,column=0,sticky='w',pady=6)
+            btn=tk.Button(holder,text=colors[key],bg=colors[key],fg='black',width=16)
+            btn.grid(row=row,column=1,sticky='ew',pady=4)
+            def pick(k=key,b=btn):
+                chosen=colorchooser.askcolor(color=colors[k],title='Выберите цвет',parent=dlg)[1]
+                if chosen:
+                    colors[k]=chosen
+                    b.configure(bg=chosen,text=chosen)
+            btn.configure(command=pick)
+        holder.columnconfigure(1,weight=1)
+        buttons=ttk.Frame(holder);buttons.grid(row=5,column=0,columnspan=2,sticky='e',pady=14)
+        def save():
+            try:
+                code=valid_code(code_var.get())
+                if not edit and code in self.sessions.wave_types:
+                    raise ValueError('Такая волна уже существует. Укажите другой код.')
+                wave=WaveType(code=code,name=name_var.get().strip(),**colors)
+            except ValueError as exc:
+                messagebox.showerror('Волна',str(exc),parent=dlg);return
+            self.sessions.wave_types[code]=wave
+            dlg.destroy()
+            if edit:
+                self.draw_plot(keep_view=True)
+                self.refresh_hodographs()
+                self._refresh_wave_selector()
+            else:self.switch_wave(code)
+        ttk.Button(buttons,text='Отмена',command=dlg.destroy).pack(side='right',padx=4)
+        ttk.Button(buttons,text='Сохранить',style='Primary.TButton',command=save).pack(side='right',padx=4)
+        code_entry.focus_set() if not edit else None
+        self.wait_window(dlg)
+
+    def create_wave_dialog(self):
+        self._wave_dialog(False)
+
+    def edit_wave_dialog(self):
+        self._wave_dialog(True)
+
+    def toggle_settings(self):
+        if self._setting_visible:
+            self.settings_holder.pack_forget()
+            self.settings_toggle.configure(text='⚙ Настройки пикирования  ▾')
+        else:
+            self.settings_holder.pack(fill='x',after=self.settings_toggle,pady=(0,5))
+            self.settings_toggle.configure(text='⚙ Настройки пикирования  ▴')
+        self._setting_visible=not self._setting_visible
+
+    def open_full_hodo(self):
+        self.worktabs.select(self.hodo_page)
+        self.after(70,self.refresh_hodographs)
+
+    def refresh_hodographs(self):
+        if not hasattr(self,'hodo_mini_ax'):return
+        # Legacy v0.5 sessions did not persist trace geometry. Fill metadata lazily
+        # for sessions that actually have confirmed picks, without decoding amplitudes.
+        for session in self.sessions.entries.values():
+            if session.geometry or not (session.picks or any(l.picks for l in session.wave_layers.values())):
+                continue
+            try:
+                meta=read_segy_headers(session.path)
+                session.validate_record(meta)
+                session.geometry=[{'src_id':h.src_id,'src_x':h.src_x,'rcv_id':h.rcv_id,
+                                   'rcv_x':h.rcv_x,'delay_ms':h.delay_ms} for h in meta.headers]
+                session.dt_us=meta.dt_us
+            except (OSError,ValueError,SegyError):
+                continue
+        series=from_workspace(self.sessions)
+        for ax,canvas,mini in ((self.hodo_mini_ax,self.hodo_mini_canvas,True),
+                               (self.hodo_full_ax,self.hodo_full_canvas,False)):
+            ax.clear()
+            ax.set_facecolor('white')
+            for idx,curve in enumerate(series):
+                wave=self.sessions.wave_types.get(curve.wave,WaveType())
+                x=[p.rcv_x for p in curve.points]
+                t=[p.time_ms for p in curve.points]
+                active=(curve.path==self.current_path and curve.wave==self._active_wave())
+                linestyle=('-' if active else ('--' if idx%2 else ':'))
+                ax.plot(x,t,color=wave.line_color,linestyle=linestyle,
+                        linewidth=2.0 if active else 1.2,alpha=1 if active else .75,
+                        label=f'ПВ {curve.src_id} · {curve.wave} · {curve.path.name}' if not mini else None,
+                        marker='o',markersize=4.5 if active else 2.8)
+            ax.set_xlabel('RCV X, м',fontsize=8 if mini else 11)
+            ax.set_ylabel('Время, мс',fontsize=8 if mini else 11)
+            ax.grid(True,linewidth=.5,alpha=.25)
+            ax.invert_yaxis()
+            ax.tick_params(labelsize=7 if mini else 10)
+            if not series:
+                ax.text(.5,.5,'Пики пока не отмечены',ha='center',va='center',
+                        color='#6b7b87',transform=ax.transAxes,fontsize=9)
+            elif not mini:
+                labels=[]
+                for i,a in enumerate(series):
+                    for b in series[i+1:]:
+                        if a.wave!=b.wave:continue
+                        result=geometry_relation(a,b)
+                        if result in ('встречные','нагоняющие'):
+                            labels.append(result)
+                summary=(f'Встречные пары: {labels.count("встречные")}  ·  '
+                         f'Нагоняющие пары: {labels.count("нагоняющие")}')
+                ax.set_title('Общий годограф — '+summary+' (геометрия по SRC_X/RCV_X)',fontsize=11)
+                if len(series)<=16:
+                    ax.legend(loc='best',fontsize=7)
+            canvas.draw_idle()
+        self._hodo_series=series
+
+    def _hodo_hit(self,event,ax):
+        if event.inaxes is not ax or event.x is None or event.y is None:return None
+        candidates=[p for curve in getattr(self,'_hodo_series',()) for p in curve.points]
+        if not candidates:return None
+        points=ax.transData.transform([(p.rcv_x,p.time_ms) for p in candidates])
+        dists=np.hypot(points[:,0]-event.x,points[:,1]-event.y)
+        idx=int(np.argmin(dists))
+        return candidates[idx] if dists[idx]<=13 else None
+
+    def hodo_press(self,event,canvas,ax):
+        if event.button!=1:return
+        hit=self._hodo_hit(event,ax)
+        if hit is not None:
+            self._hodo_drag=(hit,float(event.x),float(event.y),canvas,ax)
+
+    def hodo_motion(self,event,canvas,ax):
+        if self._hodo_drag is None or self._hodo_drag[3] is not canvas:return
+        hit=self._hodo_drag[0]
+        if event.ydata is not None:
+            self.info_var.set(f'Годограф: SRC_ID={hit.src_id} · Wave={hit.wave} · '
+                              f'X={hit.rcv_x:g} м · время → {event.ydata:.3f} мс')
+
+    def hodo_release(self,event,canvas,ax):
+        drag=self._hodo_drag
+        self._hodo_drag=None
+        if drag is None or drag[3] is not canvas:return
+        point,x0,y0,_,_=drag
+        moved=(event.x is not None and event.y is not None and
+               np.hypot(float(event.x)-x0,float(event.y)-y0)>6)
+        if not self.activate_file(point.path):return
+        self.switch_wave(point.wave)
+        self.selected_trace=point.trace_index
+        if moved and event.ydata is not None:
+            trace=point.trace_index
+            estimated=int(round((float(event.ydata)-self.record.headers[trace].delay_ms)*1000/self.record.dt_us))
+            radius=int(round(max(self._radius_ms(),4.0)*1000/self.record.dt_us))
+            original=self.state_model.picks.get(trace)
+            if original is None:return
+            sign='positive' if self.display_signals[trace,original]>0 else 'negative'
+            new=nearest_peak(self.display_signals[trace],estimated,radius,sign)
+            if new is None:
+                messagebox.showwarning('Годограф','Рядом с выбранным временем нет экстремума нужной полярности.')
+                return
+            if new!=original and self._approve_pick(trace,new):
+                self._snapshot()
+                self.state_model.set_pick(trace,new)
+                self._changes(f'Пик исправлен на годографе и сейсмограмме: t={self.record.time_ms(trace,new):.3f} мс')
+        else:
+            # Highlight the relevant receiver and time on the seismic plot.
+            width=self.ax.get_xlim()[1]-self.ax.get_xlim()[0]
+            span=abs(self.ax.get_ylim()[1]-self.ax.get_ylim()[0])
+            t=point.time_ms
+            self.ax.set_xlim(point.rcv_x-width/2,point.rcv_x+width/2)
+            self.ax.set_ylim(t+span/2,t-span/2)
+            self.canvas.draw_idle()
+            self.worktabs.select(0)
+            self.info_var.set(f'Выбран пик на сейсмограмме: ПВ {point.src_id}, Wave={point.wave}, X={point.rcv_x:g} м')
+
+    def _auto_propose_if_enabled(self):
+        if not self.auto_interp_var.get() or not self.state_model or len(self.state_model.picks)<2:return
+        try:
+            count=self.state_model.suggest_between(radius_ms=self._radius_ms(),
+                 polarity=self.pol_var.get(),signals=self.display_signals)
+            self._changes(f'Автоинтерполяция: {count} предварительных точек. Проверьте и подтвердите.')
+        except ValueError as exc:
+            self.info_var.set(f'Интерполяция: {exc}')
+
+    def import_from_txt(self):
+        """Transactional geometry-checked import. Never silently skip missing SGY/rows."""
+        txt=filedialog.askopenfilename(title='Выберите TXT с результатами пикирования',
+                                       filetypes=[('Результаты TXT/CSV','*.txt *.csv'),('Все файлы','*.*')])
+        if not txt:return
+        files=filedialog.askopenfilenames(title='Выберите все SEG-Y, которые перечислены в TXT',
+                     filetypes=[('SEG-Y','*.sgy *.segy *.SGY *.SEGY'),('Все файлы','*.*')])
+        if not files:
+            if not self.sessions.entries:return
+            if not messagebox.askyesno('Импорт','Использовать уже загруженные SGY для сопоставления?'):
+                return
+            files=tuple(str(p) for p in self.sessions.entries)
+        try:
+            rows=read_pick_file(txt)
+            indexes=[read_segy_headers(p) for p in files]
+            matches=validate_pick_import(rows,indexes)
+            n=sum(len(picks) for layers in matches.values() for picks in layers.values())
+            if not n:raise ValueError('В TXT нет подтверждённых времён для импорта.')
+        except (OSError,ValueError,SegyError) as exc:
+            messagebox.showerror('Не удалось импортировать TXT',str(exc));return
+        if not messagebox.askyesno('Импорт TXT',
+                 f'Проверка завершена. SGY: {len(matches)}, точек: {n}.\n'
+                 'Времена сопоставлены с геометрией и шагом дискретизации.\n\n'
+                 'Добавить пики в открытый сеанс? Совпадающие точки будут заменены.'):
+            return
+        self._store_session()
+        self.sessions.add(files)
+        index_by_path={Path(r.path).resolve():r for r in indexes}
+        for path,layers in matches.items():
+            session=self.sessions.entries[path]
+            rec=index_by_path[path]
+            session.geometry=[{'src_id':h.src_id,'src_x':h.src_x,'rcv_id':h.rcv_id,
+                               'rcv_x':h.rcv_x,'delay_ms':h.delay_ms} for h in rec.headers]
+            session.n_traces=rec.n_traces
+            session.n_samples=rec.n_samples
+            session.dt_us=rec.dt_us
+            session.file_size=Path(path).stat().st_size
+            session.dirty=True
+            for code,picks in layers.items():
+                if code not in self.sessions.wave_types:
+                    self.sessions.wave_types[code]=WaveType(code=code,name=f'Волна {code}',
+                                              line_color=wave_color(len(self.sessions.wave_types)))
+                if session.active_wave=='0' and not session.layer('0').picks:
+                    session.active_wave=code
+                layer=session.layer(code)
+                layer.picks.update(picks)
+                layer.proposals.clear();layer.proposal_info.clear()
+        first=next(iter(matches))
+        self.current_path=None
+        self.record=None
+        self.state_model=None
+        if self.activate_file(first):
+            self.info_var.set(f'Импортировано {n} пиков из {len(matches)} SGY; проверена геометрия и шаг времени.')
+            self.refresh_hodographs()
+
+    def _attach_tooltips(self):
+        explanations={
+          'Открыть SGY':'Загрузить одну или несколько сейсмограмм SEG-Y/SGY.',
+          'Сохранить проект':'Сохранить все волны, точки и настройки сеанса для продолжения работы.',
+          'Экспорт TXT':'Сохранить подтверждённые пики активной сейсмограммы и волны.',
+          'Общий TXT':'Объединить пики всех волн и всех открытых SGY в один TXT.',
+          'Импорт TXT':'Загрузить SGY и TXT, проверить идентификаторы и координаты и восстановить точки.',
+          'Отменить':'Отменить последнее изменение пиков текущей волны.',
+          'Удалить точку':'Удалить выбранный пик текущей волны.',
+          'Проследить фазу':'Предложить промежуточные пики по согласованной форме сигнала; их нужно подтвердить.',
+          'Сброс масштаба':'Показать весь временной и пространственный диапазон SGY.',
+          'AGC':'Автоматически выравнивать усиление амплитуд по времени.',
+          'Цвет':'Включить/выключить красно-синюю заливку сейсмических амплитуд.',
+          'Проекции':'Показать/скрыть горизонтальные линии от пика к оси приёмника.',
+          'Предупреждать о скачке':'Запрашивать подтверждение при подозрительной смене фазы.',
+          '+ Волна':'Создать новую волну с собственным кодом, названием и цветами.',
+          'Палитра':'Изменить название и цвета активной волны.',
+          'Автоинтерполяция между опорами':'Предлагать пики между выбранными опорными точками; без подтверждения они не экспортируются.',
+          'Развернуть годограф':'Открыть общий годограф во второй полноразмерной вкладке.',
+          'Подтвердить предложенные точки':'Сделать проверенные автоматические точки подтверждёнными.',
+          'Рассчитать и показать таблицу':'Показать времена по текущим подтверждённым пикам.',
+          'Время:':'Выбрать отображение времени в миллисекундах или микросекундах.',
+        }
+        def walk(widget):
+            for child in widget.winfo_children():
+                if isinstance(child,(ttk.Button,ttk.Checkbutton,ttk.Radiobutton,ttk.Combobox,ttk.Scale)):
+                    try:label=str(child.cget('text')).strip()
+                    except tk.TclError:label=''
+                    for prefix,text in explanations.items():
+                        if prefix in label:
+                            ToolTip(child,text);break
+                    else:
+                        if label:
+                            ToolTip(child,f'{label}: используйте этот элемент для управления пикированием или просмотром.')
+                        elif isinstance(child,ttk.Combobox):
+                            ToolTip(child,'Выбрать доступный вариант из списка.')
+                walk(child)
+        walk(self)
 
     def change_gain(self, delta: float):
         """Nudge the same Tk variable that drives the slider (no alternative gain path)."""
@@ -350,11 +753,11 @@ class PickerApp(tk.Tk):
     def export_all(self):
         """One merged TXT containing only confirmed picks, sourced from each SGY header."""
         self._store_session()
-        ready=[entry for entry in self.sessions.entries.values() if entry.picks]
+        ready=[entry for entry in self.sessions.entries.values() if any(layer.picks for layer in entry.wave_layers.values()) or entry.picks]
         if not ready:
             messagebox.showinfo('Общий экспорт','Нет SGY с подтверждёнными пиками.');return
         target=filedialog.asksaveasfilename(title='Сохранить общий TXT по всем сейсмограммам',
-                 defaultextension='.txt', initialfile='SeisPeak_all_traveltimes.txt',
+                 defaultextension='.txt', initialfile='PicEditor_all_traveltimes.txt',
                  filetypes=[('Текстовые файлы','*.txt')])
         if not target:return
         rows=[]
@@ -363,8 +766,10 @@ class PickerApp(tk.Tk):
             try:
                 rec=read_segy(session.path)
                 session.validate_record(rec)
-                picker=PickerState(rec,picks=session.picks.copy())
-                rows.extend(picker.rows(all_traces=False))
+                for code,layer in session.wave_layers.items():
+                    rows.extend(rows_for_layer(rec,layer,code))
+                if not session.wave_layers and session.picks:
+                    rows.extend(rows_for_layer(rec,session.layer('0'),'0'))
             except (OSError,ValueError,SegyError) as exc:
                 failures.append(f'{session.path.name}: {exc}')
         if failures:
@@ -385,7 +790,15 @@ class PickerApp(tk.Tk):
         if self.current_path not in self.sessions.entries or not self.state_model:return
         session=self.sessions.entries[self.current_path]
         state=self.state_model
-        session.picks=state.picks.copy()
+        code=self._active_wave()
+        session.active_wave=code
+        layer=WaveLayer(picks=state.picks.copy(),proposals=state.proposals.copy(),
+                        proposal_info=state.proposal_info.copy(),failed_intervals=state.failed_intervals,
+                        history=[h.copy() for h in self.history],selected_trace=self.selected_trace)
+        session.wave_layers[code]=layer
+        if code=='0':session.picks=state.picks.copy()
+        session.geometry=[{'src_id':h.src_id,'src_x':h.src_x,'rcv_id':h.rcv_id,
+                           'rcv_x':h.rcv_x,'delay_ms':h.delay_ms} for h in self.record.headers]
         session.proposals=state.proposals.copy()
         session.proposal_info=state.proposal_info.copy()
         session.failed_intervals=state.failed_intervals
@@ -423,15 +836,25 @@ class PickerApp(tk.Tk):
         self.result_window=None
         self.current_path=dest
         self.record=rec
+        if not session.geometry:
+            session.geometry=[{'src_id':h.src_id,'src_x':h.src_x,'rcv_id':h.rcv_id,
+                               'rcv_x':h.rcv_x,'delay_ms':h.delay_ms} for h in rec.headers]
+            session.n_traces=rec.n_traces
+            session.n_samples=rec.n_samples
+            session.dt_us=rec.dt_us
         state=PickerState(rec)
-        state.picks=session.picks.copy()
-        state.proposals=session.proposals.copy()
-        state.proposal_info=session.proposal_info.copy()
-        state.failed_intervals=session.failed_intervals
+        wave_code=session.active_wave if session.active_wave in self.sessions.wave_types else '0'
+        self.current_wave_code=wave_code
+        self.wave_code_var.set(wave_code)
+        layer=session.layer(wave_code)
+        state.picks=layer.picks.copy()
+        state.proposals=layer.proposals.copy()
+        state.proposal_info=layer.proposal_info.copy()
+        state.failed_intervals=layer.failed_intervals
         self.state_model=state
-        self.history=[h.copy() for h in session.history]
+        self.history=[h.copy() for h in layer.history]
         self.unsaved_changes=session.dirty
-        self.selected_trace=session.selected_trace
+        self.selected_trace=layer.selected_trace
         self.gain_var.set(session.gain)
         self.agc_var.set(session.agc)
         self.color_var.set(session.color)
@@ -439,14 +862,14 @@ class PickerApp(tk.Tk):
         self._signals_cache = None
         self.display_signals = None
         self.display_x = None
-        self.title(f'SeisPeak  •  {dest.name}  •  {len(self.sessions.entries)} файлов')
+        self.title(f'Pic Editor (PE)  •  {dest.name}  •  {len(self.sessions.entries)} файлов')
         coord=rec.receiver_x
         self.stats_var.set(f'{rec.n_traces} трасс  •  {rec.n_samples} отсчётов  •  '
                            f'{rec.dt_us/1000:g} мс  •  X: {coord.min():g}–{coord.max():g} м')
         self.draw_plot(keep_view=False)
         if session.view is not None:
             self.ax.set_xlim(*session.view[0]);self.ax.set_ylim(*session.view[1]);self.canvas.draw_idle()
-        self.update_table();self._refresh_selector()
+        self._refresh_wave_selector();self.update_table();self._refresh_selector();self.refresh_hodographs()
         self.info_var.set(f'Открыта {dest.name}; подтверждено пиков: {len(state.picks)}.')
         return True
 
@@ -456,7 +879,7 @@ class PickerApp(tk.Tk):
 
     def on_scroll(self,event):
         """Mouse-centered zoom with wheel/trackpad; axes are in meters and milliseconds."""
-        if not self.record or event.inaxes is not self.ax or self.toolbar.mode:return
+        if not self.record or event.inaxes is not self.ax:return
         if event.xdata is None or event.ydata is None:return
         direction=1 if event.button=='up' else -1 if event.button=='down' else 0
         if not direction:return
@@ -470,8 +893,11 @@ class PickerApp(tk.Tk):
             return a,b
         coords=self.record.receiver_x
         dx=float(np.median(np.diff(np.unique(coords)))) if len(np.unique(coords))>1 else 2.
-        new_x=zoom(old_x,event.xdata,max(.1,abs(dx)*.5))
-        new_y=zoom(old_y,event.ydata,self.record.dt_us/1000*5)
+        modifier=str(getattr(event,'key','') or '').lower()
+        only_y='shift' in modifier
+        only_x=('control' in modifier or 'ctrl' in modifier) and not only_y
+        new_x=old_x if only_y else zoom(old_x,event.xdata,max(.1,abs(dx)*.5))
+        new_y=old_y if only_x else zoom(old_y,event.ydata,self.record.dt_us/1000*5)
         if scale>1 and self.full_xlim is not None and abs(new_x[1]-new_x[0])>=abs(self.full_xlim[1]-self.full_xlim[0]):
             new_x=self.full_xlim
         if scale>1 and self.full_ylim is not None and abs(new_y[1]-new_y[0])>=abs(self.full_ylim[1]-self.full_ylim[0]):
@@ -547,6 +973,17 @@ class PickerApp(tk.Tk):
                 self.ax.fill_betweenx(t,x[i],wavex,where=self.display_signals[i]<0,
                     color='#2222bb',alpha=.57,linewidth=0,zorder=1)
             self.ax.plot(wavex,t,color='#101828',linewidth=.62,zorder=2,antialiased=True)
+        # Inactive waves remain visible, but cannot be modified accidentally.
+        session=self.sessions.entries.get(self.current_path)
+        if session:
+            for code,layer in session.wave_layers.items():
+                if code==self._active_wave() or not layer.picks:continue
+                wave=self.sessions.wave_types.get(code,WaveType())
+                items=sorted(layer.picks.items(),key=lambda kv:x[kv[0]])
+                self.ax.plot([x[i] for i,_ in items],
+                             [rec.time_ms(i,s) for i,s in items],
+                             color=wave.line_color,linewidth=1.3,linestyle='--',alpha=.6,zorder=8)
+        wave=self.sessions.wave_types.get(self._active_wave(),WaveType())
         if state.proposals:
             prop_points = sorted(state.proposals.items())
             if len(prop_points)>1:
@@ -565,14 +1002,14 @@ class PickerApp(tk.Tk):
         if pairs:
             xx=[x[i] for i,_ in pairs]
             yy=[rec.time_ms(i,s) for i,s in pairs]
-            self.ax.plot(xx,yy,color='#00a65c',linewidth=2,alpha=.92,zorder=11)
+            self.ax.plot(xx,yy,color=wave.line_color,linewidth=2,alpha=.92,zorder=11)
             for i,s in pairs:
                 yy_i=rec.time_ms(i,s);x_peak=self.display_x[i,s]
                 if self.show_guides_var.get():
-                    self.ax.plot([x[i],x_peak],[yy_i,yy_i],color='#f59e0b',
+                    self.ax.plot([x[i],x_peak],[yy_i,yy_i],color=wave.guide_color,
                         linewidth=1.6,linestyle='--',zorder=12)
-                self.ax.scatter([x_peak],[yy_i],s=36,c='#ffda1f',edgecolors='#101828',linewidths=.8,zorder=13)
-                self.ax.scatter([x[i]],[yy_i],s=17,c='#00a65c',edgecolors='white',linewidths=.5,zorder=14)
+                self.ax.scatter([x_peak],[yy_i],s=36,c=wave.peak_color,edgecolors='#101828',linewidths=.8,zorder=13)
+                self.ax.scatter([x[i]],[yy_i],s=17,c=wave.line_color,edgecolors='white',linewidths=.5,zorder=14)
                 if i in warnings:
                     self.ax.scatter([x[i]],[yy_i],s=82,facecolors='none',edgecolors='#f28c28',linewidths=1.8,zorder=15)
         margin=step*1.5
@@ -613,7 +1050,9 @@ class PickerApp(tk.Tk):
         self.unsaved_changes=True
         self.info_var.set(msg)
         self.update_table()
+        self._store_session()
         self.draw_plot(keep_view=True)
+        self.refresh_hodographs()
 
     def _radius_ms(self) -> float:
         try:
@@ -728,6 +1167,10 @@ class PickerApp(tk.Tk):
         return True
 
     def on_release(self,event):
+        if self._pan_origin is not None:
+            self._pan_origin=None
+            self._pan_active=False
+            return
         if self._region_start is not None:
             x0,y0=self._region_start
             origin=self._region_origin
@@ -810,7 +1253,10 @@ class PickerApp(tk.Tk):
     def on_click(self,event):
         if not self.record or not self.state_model or event.inaxes is not self.ax:
             return
-        if self.toolbar.mode:return
+        if event.button==1 and 'space' in str(event.key or '').lower():
+            self._pan_origin=(event.x,event.y,tuple(self.ax.get_xlim()),tuple(self.ax.get_ylim()))
+            self._pan_active=False
+            return
         if event.button==1 and event.key and 'shift' in str(event.key).lower():
             self._region_start=(float(event.xdata),float(event.ydata))
             self._region_origin=(event.x,event.y)
@@ -831,7 +1277,9 @@ class PickerApp(tk.Tk):
                 return
             found=self._nearest_visual_peak(event)
             if found is None:
-                self.info_var.set('Пик не найден рядом с курсором. Увеличьте масштаб и нажмите на вершину чёрной кривой.')
+                self._pan_origin=(event.x,event.y,tuple(self.ax.get_xlim()),tuple(self.ax.get_ylim()))
+                self._pan_active=False
+                self.info_var.set('Перетащите пустой участок мышью для перемещения графика.')
                 return
             i,s=found
             if not self._approve_pick(i,s):return
@@ -839,10 +1287,23 @@ class PickerApp(tk.Tk):
             self.selected_trace=i
             h=self.record.headers[i];travel=self.record.time_ms(i,s)
             self._changes(f'Пик: приёмник {h.rcv_id}, X={h.rcv_x:g} м, t={travel:.3f} мс, отсчёт {s}')
+            self._auto_propose_if_enabled()
         except ValueError as e:
             messagebox.showerror('Параметры пика',str(e))
 
     def on_motion(self,event):
+        if self._pan_origin is not None and event.inaxes is self.ax:
+            px,py,xlim,ylim=self._pan_origin
+            if event.x is not None and event.y is not None:
+                if abs(event.x-px)+abs(event.y-py)>=5:self._pan_active=True
+                if self._pan_active:
+                    # Pixel translation maps into the current data viewport.
+                    dx=-(event.x-px)*(xlim[1]-xlim[0])/max(self.ax.bbox.width,1)
+                    dy=-(event.y-py)*(ylim[1]-ylim[0])/max(self.ax.bbox.height,1)
+                    self.ax.set_xlim(xlim[0]+dx,xlim[1]+dx)
+                    self.ax.set_ylim(ylim[0]-dy,ylim[1]-dy)
+                    self.canvas.draw_idle()
+            return
         if self._region_start is not None:
             if event.inaxes is self.ax and event.xdata is not None and event.ydata is not None:
                 x0,y0=self._region_start
@@ -929,7 +1390,8 @@ class PickerApp(tk.Tk):
 
     def calculate(self):
         if not self.state_model:return
-        n=len(self.state_model.picks)
+        self._store_session()
+        n=sum(len(layer.picks) for layer in self.sessions.entries[self.current_path].wave_layers.values())
         self.update_table()
         if n==0:
             messagebox.showinfo('Расчёт','Пока нет подтверждённых точек. Выбери пики мышкой.')
@@ -954,9 +1416,12 @@ class PickerApp(tk.Tk):
         window.transient(self)
         window.lift()
         top=ttk.Frame(window,padding=(14,12));top.pack(fill='x')
-        n=len(self.state_model.picks)
+        self._store_session()
+        session=self.sessions.entries[self.current_path]
+        layers=[(code,layer) for code,layer in session.wave_layers.items() if layer.picks]
+        n=sum(len(layer.picks) for _,layer in layers)
         warnings=audit_picks(self.record,self.state_model.picks,self._tolerance_ms())
-        ttk.Label(top,text=f'РЕЗУЛЬТАТЫ РАСЧЁТА  ·  {n} из {self.record.n_traces} приёмников',
+        ttk.Label(top,text=f'РЕЗУЛЬТАТЫ РАСЧЁТА  ·  {len(layers)} волн · {n} пиков',
                   font=('Helvetica Neue',12,'bold') if sys.platform=='darwin' else ('Segoe UI',12,'bold'),
                   foreground='#143f60').pack(anchor='w')
         ttk.Label(top,text=f'Точность исходного времени: {self.record.dt_us/1000:g} мс  |  '
@@ -990,19 +1455,21 @@ class PickerApp(tk.Tk):
         def populate():
             tree.heading('Traveltime',text='Traveltime, '+self.unit_var.get())
             for child in tree.get_children():tree.delete(child)
-            for i, h in enumerate(self.record.headers):
-                if i not in self.state_model.picks and not show_all.get():continue
-                tt=self.record.time_ms(i,self.state_model.picks[i]) if i in self.state_model.picks else None
-                values=(h.src_id,f'{h.src_x:g}',0,h.rcv_id,f'{h.rcv_x:g}',0,
-                        self._time_display(tt) if tt is not None else '',0)
-                tree.insert('','end',values=values,tags=('warning',) if i in warnings else ())
+            for code,layer in layers:
+                for i,h in enumerate(self.record.headers):
+                    if i not in layer.picks and not show_all.get():continue
+                    tt=self.record.time_ms(i,layer.picks[i]) if i in layer.picks else None
+                    values=(h.src_id,f'{h.src_x:g}',0,h.rcv_id,f'{h.rcv_x:g}',0,
+                            self._time_display(tt) if tt is not None else '',code)
+                    tree.insert('','end',values=values,
+                                tags=('warning',) if code==self._active_wave() and i in warnings else ())
         self._result_populate=populate
         populate()
         foot=ttk.Frame(window,padding=(14,12));foot.pack(fill='x')
         ttk.Checkbutton(foot,text='Показывать все приёмники',variable=show_all,
                         command=populate).pack(side='left')
         def copy_table():
-            rows=self.state_model.rows(all_traces=show_all.get())
+            rows=[row for code,layer in layers for row in rows_for_layer(self.record,layer,code,all_traces=show_all.get())]
             from .picking import _format
             header=list(keys)
             header[6]='Traveltime_us' if self.unit_var.get()=='мкс' else 'Traveltime_ms'
@@ -1074,18 +1541,8 @@ class PickerApp(tk.Tk):
 
     def save_project(self):
         if not self.state_model:return
-        if len(self.sessions.entries)>1:
-            self.save_workspace()
-            return
-        path=filedialog.asksaveasfilename(title='Сохранить проект',defaultextension='.stp.json',
-             filetypes=[('Проект пикирования','*.json')],initialfile=self.record.path.stem+'.stp.json')
-        if path:
-            try:
-                self.state_model.save_project(path)
-                self.unsaved_changes=False
-                self.sessions.entries[self.current_path].dirty=False
-                self.info_var.set('Проект сохранён: '+path)
-            except OSError as e:messagebox.showerror('Сохранение',str(e))
+        # Always use schema v3: one or more waves must not be lost on save.
+        self.save_workspace()
 
     def open_project(self):
         path=filedialog.askopenfilename(title='Открыть проект или сеанс',filetypes=[('Проекты JSON','*.json')])
@@ -1093,7 +1550,7 @@ class PickerApp(tk.Tk):
         try:
             import json
             data=json.loads(Path(path).read_text(encoding='utf-8'))
-            if data.get('schema_version')==2:
+            if data.get('schema_version') in (2,3):
                 if not self.confirm_discard():return
                 library,current=SessionLibrary.load(path)
                 missing=[p.name for p in library.entries if not p.is_file()]
@@ -1130,30 +1587,35 @@ class PickerApp(tk.Tk):
             messagebox.showerror('Не удалось открыть проект',str(e))
 
     def export(self,fmt):
-        if not self.state_model:return
-        if not self.state_model.picks:
-            messagebox.showinfo('Экспорт','Сначала отметь и подтверди пики.');return
+        if not self.record or not self.state_model:return
+        self._store_session()
+        session=self.sessions.entries[self.current_path]
+        layers=[(code,layer) for code,layer in session.wave_layers.items() if layer.picks]
+        if not layers:
+            messagebox.showinfo('Экспорт','Сначала отметьте и подтвердите пики хотя бы одной волны.');return
         filetypes=[('Текстовый табличный файл','*.txt')] if fmt=='txt' else [('CSV','*.csv')]
-        path=filedialog.asksaveasfilename(title='Экспорт Travel time',defaultextension='.'+fmt,
-             filetypes=filetypes, initialfile=self.record.path.stem+'_traveltime.'+fmt)
+        path=filedialog.asksaveasfilename(title='Экспорт всех волн текущего SGY',defaultextension='.'+fmt,
+             filetypes=filetypes,initialfile=self.record.path.stem+'_traveltime.'+fmt)
         if not path:return
-        missing=self.record.n_traces-len(self.state_model.picks)
         all_rows=False
-        if missing:
+        # One-wave compatibility: optionally include unpicked traces with blank time.
+        if len(layers)==1 and len(layers[0][1].picks)<self.record.n_traces:
+            missing=self.record.n_traces-len(layers[0][1].picks)
             choice=messagebox.askyesnocancel('Незаполненные трассы',
-                f'Пиков нет на {missing} из {self.record.n_traces} трасс.\n\n'
-                'Да — экспортировать все трассы с пустым Traveltime.\n'
-                'Нет — экспортировать только пикированные трассы.\n'
-                'Отмена — вернуться к редактированию.')
+                f'Не пропикированы {missing} приёмников.\n\n'
+                'Да — все трассы, с пустыми Traveltime.\n'
+                'Нет — только подтверждённые пики.\nОтмена — вернуться.')
             if choice is None:return
-            all_rows=choice
+            all_rows=bool(choice)
+        rows=[]
+        for code,layer in layers:
+            rows.extend(rows_for_layer(self.record,layer,code,all_rows))
         try:
-            if fmt=='txt':self.state_model.export_txt(path,all_rows)
-            else:self.state_model.export_csv(path,all_rows)
-            self.info_var.set('Файл результатов сохранён: '+path)
-            messagebox.showinfo('Готово',f'Экспорт выполнен:\n{path}')
-        except OSError as e:
-            messagebox.showerror('Ошибка экспорта',str(e))
+            export_table(path,rows,delimiter='\t' if fmt=='txt' else ';')
+            self.info_var.set(f'Экспорт: {len(rows)} строк, {len(layers)} волн: '+path)
+            messagebox.showinfo('Готово',f'Сохранено {len(rows)} строк, волн: {len(layers)}.\n{path}')
+        except OSError as exc:
+            messagebox.showerror('Ошибка экспорта',str(exc))
 
     def export_image(self):
         if not self.record:return
@@ -1175,23 +1637,21 @@ class PickerApp(tk.Tk):
             self.destroy()
 
     def help_dialog(self):
-        messagebox.showinfo('Краткая инструкция',
-            '1. Выберите один или несколько SEG-Y / SGY; переключайте их вверху окна.\n'
-            '2. Колёсико мыши увеличивает участок под курсором; Shift+перетаскивание выделяет область.\n'
-            '3. Верни режим лупы в обычный и щёлкай вершины чёрных пиков.\n'
-            '4. Жёлтая точка — пик, зелёная — горизонтальная проекция на ось трассы.\n'
-            '   Чтобы перенести пик, перетащи жёлтую или зелёную точку вверх/вниз.\n'
-            '5. Для автопрослеживания отметь не менее двух опорных пиков одной фазы,\n'
-            '   затем нажми «Проследить фазу между опорами» (Ctrl+P).\n'
-            '   Красные предложения — повод дополнительно проверить фазу.\n'
-            '6. Проверь предложенные пики до подтверждения; при ошибке добавь опорные\n'
-            '   точки и запусти прослеживание заново. Затем рассчитай Travel time.\n'
-            '7. Переключатель мс/мкс меняет только отображение таблиц; экспорт в мс.\n'
-            '   Для нескольких SGY «Сохранить проект» сохраняет весь сеанс.\n\n'
-            'При пересечении кривых можно выбрать приёмник в таблице и включить привязку только к нему.\n'
-            'Правый клик удаляет пик; Ctrl+Z отменяет действие.\n'
-            'При скачке времени появится вопрос, не перепутана ли фаза.\n'
-            'Подсветка оранжевым обозначает рекомендацию проверить результат, а не ошибку.')
+        messagebox.showinfo('Pic Editor — краткая инструкция',
+            '1. Откройте SGY (один или несколько) и выберите нужную сейсмограмму вверху.\n'
+            '2. Колесо — зум XY, Shift+колесо — только время Y, Ctrl+колесо — только X.\n'
+            '   ЛКМ на пустом поле + протягивание — перемещение; Shift+протягивание — рамка зума.\n'
+            '3. «+ Волна» создаёт тип волны с кодом, названием и цветами.\n'
+            '   Выберите волну и отмечайте соответствующие пики на трассах.\n'
+            '4. «⚙ Настройки пикирования» открывает параметры и автоинтерполяцию.\n'
+            '   Предложения требуют подтверждения — только тогда они попадают в экспорт.\n'
+            '5. Справа годограф всех SGY: точку можно выбрать или перетащить по времени.\n'
+            '   «Развернуть годограф» откроет его во второй вкладке.\n'
+            '6. «Рассчитать» показывает таблицу. «Общий TXT» сохраняет все волны и SGY.\n'
+            '   Время в TXT всегда в миллисекундах, поле Wave — выбранный код.\n'
+            '7. «Импорт TXT» восстанавливает пики после проверки SGY и геометрии.\n'
+            '   «Сохранить проект» сохраняет всё в JSON-сеансе.\n\n'
+            'Наведение на кнопки показывает подсказки. Исходные SGY не изменяются.')
 
 
 def main():

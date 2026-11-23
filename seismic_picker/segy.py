@@ -173,3 +173,47 @@ def read_segy(path: str | Path, endian: str | None = None) -> SeismicRecord:
         if not np.all(np.isfinite(samples)):
             raise SegyError('В данных присутствуют NaN/Infinity; требуется предварительная проверка SEG-Y.')
     return SeismicRecord(path.resolve(), headers, samples, dt, e, fmt)
+
+@dataclass
+class SeismicHeaderIndex:
+    """Lightweight geometry-only representation for cross-file validation."""
+    path: Path
+    headers: list[TraceHeader]
+    n_samples: int
+    dt_us: int
+
+    @property
+    def n_traces(self):
+        return len(self.headers)
+
+    def time_ms(self, i, s):
+        return self.headers[i].delay_ms + s * self.dt_us/1000
+
+
+def read_segy_headers(path: str | Path, endian: str | None = None) -> SeismicHeaderIndex:
+    """Read trace headers without loading amplitudes; suitable for hundreds of SGY files."""
+    path = Path(path).resolve()
+    size=path.stat().st_size
+    if size<3844:raise SegyError('Файл слишком маленький для SEG-Y.')
+    with path.open('rb') as f:
+        f.seek(3200)
+        e,dt,ns,fmt,start=_choose_endian(f.read(400),size,endian)
+        trace_size=240+ns*FORMATS[fmt][0]
+        count=(size-start)//trace_size
+        headers=[]
+        for i in range(count):
+            f.seek(start+i*trace_size)
+            h=f.read(240)
+            if len(h)!=240:raise SegyError(f'Оборван заголовок трассы {i+1}.')
+            this_ns=_u16(h,114,e) or ns
+            this_dt=_u16(h,116,e) or dt
+            if this_ns!=ns or this_dt!=dt:
+                raise SegyError('Переменная длина или дискретизация трасс пока не поддерживается.')
+            cs=_i16(h,70,e)
+            headers.append(TraceHeader(
+                seq_line=_i32(h,0,e) or i+1,
+                ffid=_i32(h,8,e), sp=_i32(h,16,e),
+                src_x=_scale_coord(_i32(h,72,e),cs),
+                rcv_x=_scale_coord(_i32(h,80,e),cs),
+                dt_us=this_dt, delay_ms=float(_i16(h,108,e)),coord_scalar=cs))
+    return SeismicHeaderIndex(path,headers,ns,dt)

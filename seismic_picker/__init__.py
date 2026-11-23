@@ -1,2 +1,2 @@
-"""Seismic TravelTime Picker — desktop SEG-Y viewer and manual arrival-time digitizer."""
-__version__ = '0.5.0'
+"""Pic Editor (PE) — multiwave SEG-Y picking and synchronized hodograph editor."""
+__version__ = '0.6.0-beta.1'

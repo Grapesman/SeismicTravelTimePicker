@@ -11,6 +11,7 @@ from pathlib import Path
 import json
 
 from .tracking import ProposalDetail
+from .waves import WaveLayer, WaveType
 
 
 @dataclass
@@ -31,6 +32,19 @@ class ShotSession:
     n_samples: int | None = None
     dt_us: int | None = None
     file_size: int | None = None
+    wave_layers: dict[str,WaveLayer] = field(default_factory=dict)
+    active_wave: str = '0'
+    geometry: list[dict] = field(default_factory=list)
+
+    def layer(self,code: str) -> WaveLayer:
+        if code not in self.wave_layers:
+            if code == '0' and self.picks:
+                self.wave_layers[code]=WaveLayer(self.picks.copy(),self.proposals.copy(),
+                                                  self.proposal_info.copy(),self.failed_intervals,
+                                                  [h.copy() for h in self.history],self.selected_trace)
+            else:
+                self.wave_layers[code]=WaveLayer()
+        return self.wave_layers[code]
 
     def validate_record(self, record):
         if self.n_traces is not None and (self.n_traces, self.n_samples, self.dt_us) != (
@@ -38,7 +52,8 @@ class ShotSession:
             raise ValueError('SEG-Y изменился: число трасс, отсчётов или шаг времени не совпадает с сохранённым сеансом.')
         if self.file_size is not None and record.path.stat().st_size != self.file_size:
             raise ValueError('Размер SEG-Y изменился после сохранения сеанса.')
-        for trace, sample in {**self.picks, **self.proposals}.items():
+        for layer in [self.layer('0'), *[layer for code,layer in self.wave_layers.items() if code!='0']]:
+          for trace, sample in {**layer.picks, **layer.proposals}.items():
             if not (0 <= trace < record.n_traces and 0 <= sample < record.n_samples):
                 raise ValueError('Точки не соответствуют размерам текущего SEG-Y.')
 
@@ -59,6 +74,8 @@ class ShotSession:
             'gain': self.gain, 'agc': self.agc, 'color': self.color,
             'n_traces': self.n_traces, 'n_samples': self.n_samples,
             'dt_us': self.dt_us, 'file_size': self.file_size,
+            'wave_layers':{code:layer.to_dict() for code,layer in self.wave_layers.items()},
+            'active_wave':self.active_wave, 'geometry':self.geometry,
         }
 
     @classmethod
@@ -73,6 +90,9 @@ class ShotSession:
         session.proposal_info={int(k):ProposalDetail(**v) for k,v in data.get('proposal_info',{}).items()}
         session.failed_intervals=tuple(tuple(map(int,pair)) for pair in data.get('failed_intervals',()))
         session.selected_trace=data.get('selected_trace')
+        session.wave_layers={str(k):WaveLayer.from_dict(v) for k,v in data.get('wave_layers',{}).items()}
+        session.active_wave=str(data.get('active_wave','0'))
+        session.geometry=list(data.get('geometry',[]))
         if data.get('view'):
             session.view=(tuple(map(float,data['view'][0])), tuple(map(float,data['view'][1])))
         session.gain=float(data.get('gain',1.1))
@@ -87,6 +107,7 @@ class SessionLibrary:
     """Insertion-ordered set of SEG-Y sessions; opening 200 filenames does not load 200 arrays."""
     def __init__(self):
         self.entries: dict[Path,ShotSession]={}
+        self.wave_types: dict[str,WaveType]={'0':WaveType()}
 
     def add(self, files) -> list[Path]:
         added=[]
@@ -99,7 +120,8 @@ class SessionLibrary:
 
     def save(self, path: str | Path, current: Path | None) -> None:
         target=Path(path).resolve()
-        data={'schema_version':2, 'current':str(current) if current else None,
+        data={'schema_version':3, 'current':str(current) if current else None,
+              'wave_types':{code:w.to_dict() for code,w in self.wave_types.items()},
               'sessions':[s.to_dict(target.parent) for s in self.entries.values()]}
         # Atomic write so an interrupted save does not corrupt the only session copy.
         temp=target.with_name(target.name+'.tmp')
@@ -113,9 +135,11 @@ class SessionLibrary:
     def load(cls, path: str | Path):
         source=Path(path).resolve()
         data=json.loads(source.read_text(encoding='utf-8'))
-        if data.get('schema_version')!=2:
+        if data.get('schema_version') not in (2,3):
             raise ValueError('Неизвестный формат многосейсмограммного сеанса.')
         library=cls()
+        library.wave_types={str(k):WaveType.from_dict(v) for k,v in data.get('wave_types', {'0':WaveType().to_dict()}).items()}
+        library.wave_types.setdefault('0',WaveType())
         for item in data['sessions']:
             entry=ShotSession.from_dict(item,source.parent)
             if entry.path in library.entries:
