@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       publish_release:
-        description: "Publish or update v0.5.0 in Releases with Windows EXE"
+        description: "Publish or update v0.6.0-beta.1 in Releases with Windows EXE"
         type: boolean
         required: true
         default: false
@@ -36,20 +36,20 @@ jobs:
         run: python -m pytest -q
 
       - name: Build standalone EXE
-        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name SeismicTravelTimePicker --icon assets/seispeak_icon.ico --add-data "assets/seispeak_icon.png;assets" main.py
+        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name PicEditor --icon assets/pic_editor_icon.ico --add-data "assets/pic_editor_icon.png;assets" main.py
 
       - name: Verify EXE exists
         shell: pwsh
         run: |
-          if (-not (Test-Path "dist/SeismicTravelTimePicker.exe")) {
-            throw "Build did not produce SeismicTravelTimePicker.exe"
+          if (-not (Test-Path "dist/PicEditor.exe")) {
+            throw "Build did not produce PicEditor.exe"
           }
 
       - name: Attach Windows artifact to workflow run
         uses: actions/upload-artifact@v4
         with:
-          name: SeismicTravelTimePicker-Windows
-          path: dist/SeismicTravelTimePicker.exe
+          name: PicEditor-Windows
+          path: dist/PicEditor.exe
           if-no-files-found: error
 
   publish-release:
@@ -66,23 +66,23 @@ jobs:
       - name: Download built Windows EXE
         uses: actions/download-artifact@v4
         with:
-          name: SeismicTravelTimePicker-Windows
+          name: PicEditor-Windows
           path: release
 
-      - name: Publish or update v0.5.0 release
+      - name: Publish or update v0.6.0-beta.1 release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: v0.5.0
+          TAG: v0.6.0-beta.1
         shell: bash
         run: |
           set -euo pipefail
-          asset="release/SeismicTravelTimePicker.exe"
+          asset="release/PicEditor.exe"
           test -s "$asset"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "$asset" --clobber
           else
             gh release create "$TAG" "$asset" \
               --target "$GITHUB_SHA" \
-              --title "Seismic TravelTime Picker v0.5.0" \
-              --notes-file RELEASE_NOTES.md
+              --title "Pic Editor (PE) v0.6.0-beta.1" \
+              --notes-file RELEASE_NOTES.md --prerelease
           fi
